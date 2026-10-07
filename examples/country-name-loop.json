@@ -1,0 +1,149 @@
+{
+  "version": 2,
+  "id": "954cf47d",
+  "name": "Country Name Loop",
+  "agents": [
+    {
+      "id": "fc40f508",
+      "x": -6,
+      "y": 18,
+      "prompt": "List out all countries in a markdown file",
+      "mode": "default",
+      "kind": "start",
+      "name": "Start"
+    },
+    {
+      "id": "98be96f6",
+      "x": 37,
+      "y": 18,
+      "prompt": "",
+      "mode": "default",
+      "name": "Agent 1"
+    },
+    {
+      "id": "d05e173b",
+      "x": 163,
+      "y": 20,
+      "prompt": "",
+      "mode": "default",
+      "name": "Agent 2"
+    },
+    {
+      "id": "9e4a48f0",
+      "x": 76,
+      "y": 18,
+      "prompt": "",
+      "mode": "default",
+      "kind": "if",
+      "name": "If",
+      "card": {
+        "check": "judge",
+        "value": "If markdown file exists "
+      }
+    },
+    {
+      "id": "db786781",
+      "x": 118,
+      "y": 13,
+      "prompt": "",
+      "mode": "default",
+      "kind": "prompt",
+      "name": "Prompt",
+      "card": {
+        "template": "Here is the list from {{from}}:\n\n{{message}}\n\nIf the list is in a file, read that file. Keep only the countries with \"United\" in their names."
+      }
+    },
+    {
+      "id": "5ccd588e",
+      "x": 118,
+      "y": 26,
+      "prompt": "",
+      "mode": "default",
+      "kind": "prompt",
+      "name": "Prompt",
+      "card": {
+        "template": "Tell the user nothing came in"
+      }
+    },
+    {
+      "id": "21b55f95",
+      "x": -3,
+      "y": 26,
+      "prompt": "",
+      "mode": "default",
+      "kind": "model",
+      "name": "Model",
+      "card": {
+        "model": "claude-sonnet-5-5",
+        "effort": "medium"
+      }
+    }
+  ],
+  "links": [
+    {
+      "id": "1fe2d60a",
+      "from": "fc40f508",
+      "to": "98be96f6",
+      "cond": "always",
+      "value": "",
+      "maxPasses": 3,
+      "template": "Message from agent \"{{from}}\":\n\n{{output}}"
+    },
+    {
+      "id": "3517aa72",
+      "from": "98be96f6",
+      "to": "9e4a48f0",
+      "cond": "always",
+      "value": "",
+      "maxPasses": 3,
+      "template": "Message from agent \"{{from}}\":\n\n{{output}}"
+    },
+    {
+      "id": "bafe0554",
+      "from": "9e4a48f0",
+      "to": "db786781",
+      "cond": "always",
+      "value": "",
+      "maxPasses": 3,
+      "template": "Message from agent \"{{from}}\":\n\n{{output}}",
+      "port": "yes"
+    },
+    {
+      "id": "94c3723c",
+      "from": "db786781",
+      "to": "d05e173b",
+      "cond": "always",
+      "value": "",
+      "maxPasses": 3,
+      "template": "Message from agent \"{{from}}\":\n\n{{output}}"
+    },
+    {
+      "id": "dcd13809",
+      "from": "9e4a48f0",
+      "to": "5ccd588e",
+      "cond": "always",
+      "value": "",
+      "maxPasses": 3,
+      "template": "Message from agent \"{{from}}\":\n\n{{output}}",
+      "port": "no"
+    },
+    {
+      "id": "41890c44",
+      "from": "5ccd588e",
+      "to": "d05e173b",
+      "cond": "always",
+      "value": "",
+      "maxPasses": 3,
+      "template": "Message from agent \"{{from}}\":\n\n{{output}}"
+    },
+    {
+      "id": "94057fe2",
+      "from": "21b55f95",
+      "to": "98be96f6",
+      "cond": "always",
+      "value": "",
+      "maxPasses": 3,
+      "template": "Message from agent \"{{from}}\":\n\n{{output}}"
+    }
+  ]
+}

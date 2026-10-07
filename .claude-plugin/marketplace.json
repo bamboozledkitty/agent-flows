@@ -1,0 +1,6 @@
+{
+  "name": "agent-flows",
+  "description": "Agent Flows: flows of linked Claude agents on a canvas",
+  "owner": { "name": "Keith Vaz" },
+  "plugins": [{ "name": "agent-flows", "source": "./" }]
+}
