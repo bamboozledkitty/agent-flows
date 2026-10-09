@@ -475,12 +475,87 @@ export function layoutEdges(nodes: CanvasNode[], edges: CanvasProps['edges'], g:
   })
 }
 
+/** Whether two cells draw in one style. */
+const same = (a: Cell, b: Cell) => a.color === b.color && a.bold === b.bold && a.dim === b.dim
+
+/** Terminal colors the desktop app's light theme washes out, as the theme's own. */
+const DESKTOP_COLOR: Record<string, string> = { yellow: 'warning' }
+
+/** A symbol or line glyph: wider than a cell in the desktop app's font, so each is placed in its own. */
+const isGlyph = (ch: string) => ch.codePointAt(0)! >= 0x2190
+const LINE = '─━┄'
+const GLYPH_BOX = { width: 1, justifyContent: 'center' } as const
+
+type DesktopRun = {
+  x: number
+  text: string
+  cell: Cell
+  /** Cells it is held to: a glyph's one, a line's length; a text's none. */
+  width?: number
+}
+/** A run on its row; `height` on an upright line, one glyph drawn down that many rows. */
+type DesktopPiece = DesktopRun & { y: number; height?: number }
+const UPRIGHT = '│┃┆'
+
+/**
+ * Every row's runs, an upright line's glyphs gathered into one piece per column:
+ * card and panel sides are most of what a canvas holds, and a tree has a size limit.
+ */
+function desktopPieces(grid: Cell[][]): DesktopPiece[] {
+  const out: DesktopPiece[] = []
+  const open = new Map<number, DesktopPiece>()
+  grid.forEach((line, y) => {
+    for (const run of desktopRuns(line)) {
+      const above = open.get(run.x)
+      if (UPRIGHT.includes(run.text)) {
+        if (above && above.text === run.text && above.y + above.height! === y && same(above.cell, run.cell)) above.height!++
+        else {
+          const piece = { ...run, y, height: 1 }
+          open.set(run.x, piece)
+          out.push(piece)
+        }
+      } else out.push({ ...run, y })
+    }
+  })
+  return out
+}
+
+/**
+ * A row as the desktop app can draw it. Its text font is proportional, so nothing
+ * lines up by counting characters: each piece is placed at its own column instead.
+ * Words keep together, a gap of two spaces or more starts a new piece, a glyph
+ * sits centred in its cell, and a horizontal line is cut to its length and its one
+ * row: its glyphs are wider than cells, and what doesn't fit would wrap below.
+ */
+function desktopRuns(line: Cell[]): DesktopRun[] {
+  const out: DesktopRun[] = []
+  let text: DesktopRun | null = null
+  for (let x = 0; x < line.length; x++) {
+    const cell = line[x]!
+    const ch = cell.ch
+    if (isGlyph(ch)) {
+      text = null
+      const last = out[out.length - 1]
+      if (LINE.includes(ch) && last?.width && last.text[0] === ch && last.x + last.width === x && same(last.cell, cell)) {
+        last.text += ch
+        last.width++
+      } else out.push({ x, text: ch, cell, width: 1 })
+    } else if (ch === ' ') {
+      // One space keeps a phrase together; a second ends the piece.
+      if (text && line[x + 1] && line[x + 1]!.ch !== ' ' && !isGlyph(line[x + 1]!.ch) && same(text.cell, line[x + 1]!)) text.text += ' '
+      else text = null
+    } else if (text && same(text.cell, cell)) text.text += ch
+    else out.push((text = { x, text: ch, cell }))
+  }
+  return out
+}
+
 const range = (lo: number, hi: number) => (hi < lo ? [] : Array.from({ length: hi - lo + 1 }, (_, i) => lo + i))
 
 const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
   const { Box, Text } = surface.elements
   const cols = Math.max(20, surface.columns)
-  const rows = Math.max(6, surface.rows)
+  const rows = Math.max(6, props.desktop?.rows ?? surface.rows)
   const leftW = cols >= 120 ? LEFT_W : 0
   const rightW = cols >= 90 ? RIGHT_W : 0
   const local: Local = surface.state ?? {
@@ -1799,8 +1874,32 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
     }
   })
 
+  if (props.desktop) {
+    const style = (cell: Cell) => ({ color: DESKTOP_COLOR[cell.color ?? ''] ?? cell.color, bold: cell.bold, dimColor: cell.dim })
+    return (
+      <Box position="relative" width={cols} height={rows}>
+        {desktopPieces(grid).map(run =>
+          run.height ? (
+            <Box position="absolute" left={run.x} top={run.y} width={1} flexDirection="column" alignItems="center">
+              {Array.from({ length: run.height }, () => <Text {...style(run.cell)}>{run.text}</Text>)}
+            </Box>
+          ) : run.width && run.width > 1 ? (
+            // Wider inside than the cells it shows, so its last glyph is cut, not wrapped away.
+            <Box position="absolute" left={run.x} top={run.y} width={run.width} height={1} overflow="hidden">
+              <Box width={run.width + 2} flexShrink={0}>
+                <Text {...style(run.cell)}>{run.text + run.text[0]}</Text>
+              </Box>
+            </Box>
+          ) : (
+            <Box position="absolute" left={run.x} top={run.y} {...(run.width ? GLYPH_BOX : { height: 1 })}>
+              <Text {...style(run.cell)}>{run.text}</Text>
+            </Box>
+          ),
+        )}
+      </Box>
+    )
+  }
   // Collapse each row into runs of one style.
-  const same = (a: Cell, b: Cell) => a.color === b.color && a.bold === b.bold && a.dim === b.dim
   return (
     <Box flexDirection="column">
       {grid.map(line => {

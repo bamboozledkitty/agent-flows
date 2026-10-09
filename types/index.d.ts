@@ -190,6 +190,8 @@ export type CanvasProps = {
   paste: { seq: number; text: string } | null
   /** The read-only chat view, while one is open. */
   chat: ChatView | null
+  /** Set in the desktop app, which draws text in a proportional font and reports no height: the rows the canvas has. */
+  desktop?: { rows: number }
 }
 
 /** The Model card's choices; `note` names entries of the "Extra models" option that were left out. */

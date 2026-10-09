@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 — 2026-10-09
+
+### Fixed
+- **The canvas draws properly in the Claude desktop app.** It came up as a few
+  rows of scrambled text: the app draws text in a proportional font and reports
+  no height for the canvas. Each label, symbol and line is now placed at its own
+  position, over the pane's full height. Card and panel sides are dashed there;
+  the terminal canvas is unchanged.
+
 ## 0.2.0 — 2026-10-09
 
 ### Added

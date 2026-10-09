@@ -1520,6 +1520,10 @@ export const register: Register = (on, options) => {
       .sort((a, b) => a.name.localeCompare(b.name))
       .map(f => ({ id: f.id, name: f.name, status: flowStatus(f.nodes, runs), count: f.nodes.filter(isAgent).length, cards: f.nodes.filter(n => !isAgent(n)).length }))
 
+    // Fit the pane's own body, not the terminal. 4 rows: the hint, the log line and the border.
+    const bodyRows = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
+    const canvasRows = Math.max(8, bodyRows - 4)
+
     const props: CanvasProps = {
       project: root.split('/').filter(Boolean).at(-1) ?? root,
       flows: summaries,
@@ -1565,10 +1569,8 @@ export const register: Register = (on, options) => {
       models,
       paste,
       chat,
+      ...(e.surface === 'desktop' ? { desktop: { rows: canvasRows } } : {}),
     }
-    // Fit the pane's own body, not the terminal. 4 rows: the hint, the log line and the border.
-    const bodyRows = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
-    const canvasRows = Math.max(8, bodyRows - 4)
 
     const nameOf = (id: string) => nodes.find(n => n.id === id)?.name ?? '?'
     const node = sel.kind === 'node' ? nodes.find(n => n.id === sel.id) : undefined
