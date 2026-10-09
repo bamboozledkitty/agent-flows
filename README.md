@@ -56,7 +56,28 @@ A folder marketplace is read from the folder itself, so edits take effect after
   Outputs only link to inputs: a wrong drop shows ⚠ and why. Drag a link's
   **▶ arrowhead** onto another card to re-wire it.
   Click a link's `◆` to edit or delete it.
+  Cards come in bands, split by lines: the **title**; the **sockets** row
+  (`in` and its dot on the left, faintly naming the card it hears from, `out`
+  and its dot on the right; an agent's
+  `model` dot under them, beside its model); the **body** (a logic card's
+  settings); and for an agent its **status** and **See response ›** (**Watch
+  live ›** while it works), which opens its chat view. Named outputs (Yes, No,
+  a Switch's branches) get a band of their own at the foot. A running card's ● blinks, here and in the Flows list; ⧉
+  means its chat is open in a tab. **Select an agent** and a wider drawer
+  opens under its card: the prompt it's on, its thinking while it works, and
+  its newest lines.
 - **Details (right):** the selected card's settings, or the link's max passes.
+  A panel taller than the screen scrolls with ▲ ▼ at its foot, or PgUp / PgDn.
+  An agent's **Instructions** go ahead of every message it gets; a line like
+  `@CLAUDE.md` adds that file (from the project, or `.md` files in `~/.claude`).
+  **▶ Test** sends one agent a one-off message.
+- **View chat** (or `v`, or a card's See response): an agent's conversation over the canvas, read-only:
+  what you typed, what other agents and runs sent it, its replies and tool
+  calls. It follows along as the agent works; ↑ ↓ PgUp PgDn scroll, End goes
+  back to the newest, and `q` or a click outside closes it. To type to the
+  agent, **Open in tab**.
+- **Text boxes:** ← → Home End and clicks move the cursor, ↑ ↓ move between
+  lines, and Cmd+V or Ctrl+V pastes. Enter or a click elsewhere saves.
   With nothing selected: the flow's name, **▶ Run flow**, **■ Stop all**, and
   Delete flow.
 - **Add a running chat:** browse folders from this project's; an orange ● marks
@@ -66,7 +87,7 @@ A folder marketplace is read from the folder itself, so edits take effect after
   100%) zooms out to 75% and 50%: cards shrink to their name and status, and
   still drag, select and link.
 - **Keys:** `n` add card · `a` add running chat · `c` link · `r` run ·
-  `o` open chat · `x` delete · `Esc` close a menu.
+  `o` open chat · `v` view chat · `x` delete · `Esc` close a menu.
 
 ## Cards
 
@@ -86,8 +107,8 @@ A folder marketplace is read from the folder itself, so edits take effect after
 
 Agents have two inputs: the top dot takes messages, the lower dot a Model card.
 With none linked, an agent runs on your default model. The model applies to
-background runs and to chats opened in a new tab; a chat already open keeps the
-model it started with. New agents are named `<flow name>-agent<N>`, numbered
+background runs, chats opened in a new tab, and chats already open, from their
+next message; your own default model is never changed. New agents are named `<flow name>-agent<N>`, numbered
 across the project, so chat names never clash.
 
 ### More models
@@ -197,6 +218,10 @@ has no telemetry.
   `osascript` with one of the two short scripts in `scripts/`, which tell iTerm
   or Terminal to run that one command. If none fits,
   the command is copied for you to paste.
+- In cmux only: `cmux tree` and `cmux surface open`, to switch to an agent's tab
+  that is already open.
+- `pbpaste`, when you press Cmd+V in one of the canvas's text boxes: the
+  clipboard's text goes into that box and nowhere else.
 - `mkdir`, `mv -f` and `rm -f` on its own files; `tail` and `find` on Claude
   Code's chat transcripts; `ps` to see which chats are running; and
   `find … -exec rm -rf` only on its own run folders in `.claude/flows/.runs/`.
@@ -207,7 +232,11 @@ has no telemetry.
   index at `~/.claude/agent-flows/agents.json`, and an End card's *save to* file,
   only inside the project. It writes no settings, start-up or build files.
 - Reads Claude Code's chat transcripts and running-chat list under `~/.claude/`,
-  to show each agent's status and offer running chats.
+  to show each agent's status, its chat view, and offer running chats.
+- Reads the files an agent's Instructions name with an `@path` line, and puts
+  their text ahead of that agent's messages. Only files inside the project or
+  the agent's own folder, or `.md` files in `~/.claude`, are read; any other
+  path is left out and noted in the log.
 
 **Hooks**
 
@@ -216,6 +245,11 @@ has no telemetry.
   short note saying which agents it is linked to. Other chats pass through
   untouched.
 - `turn.complete`: for an agent's chat, hand its reply to the next cards.
+- `turn.step`: for an agent's chat with a Model card linked in, name that
+  card's model and effort on each request. Other chats, and subagents, pass
+  through untouched; your default model is never changed.
+- `prompt.edit`: while the canvas has the keyboard, a paste meant for one of its
+  text boxes goes there and not into Claude's prompt box. Typing is untouched.
 - `session.send`: refuse an agent's `SendMessage` to an agent it isn't linked to.
 - `ui.close`, `ui.message`, `ui.render`, `command.run` for `/flow`: the canvas.
 
@@ -223,7 +257,8 @@ It hooks no tool calls, permission prompts, network or process events.
 
 **What it sends between chats**
 
-A hand-off is the sending agent's reply, wrapped in the link's template and a
+A hand-off is the sending agent's reply, with the receiving agent's Instructions
+ahead of it, wrapped in the link's template and a
 `[Agent Flows · run <id> · hand-off N]` tag, delivered to the next agent's chat
 on this machine. If, Switch and Loop cards set to plain English send that same
 message to Claude, through Claude Code, for a one-word answer. Nothing else

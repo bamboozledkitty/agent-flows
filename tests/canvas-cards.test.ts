@@ -64,7 +64,7 @@ describe('logic cards on the canvas', () => {
       return mid
     }
     const listerRow = (await lines()).findIndex(r => r.includes('Lister'))
-    const dotY = listerRow + 1 // the dot sits on the row under the name
+    const dotY = listerRow + 3 // the dot sits in the sockets row, under the title band
     const dotX = (await lines())[dotY]!.indexOf('●', (await lines())[listerRow]!.indexOf('Lister'))
     const doneCard = await at('■ Done', 26, 160)
     const mid = await drag({ x: dotX, y: dotY }, { x: doneCard.x + 4, y: doneCard.y + 2 })
@@ -74,8 +74,8 @@ describe('logic cards on the canvas', () => {
 
     // Every link enters its target's input dot on the left: ▶◉.
     const filterName = await at('Filter', 26, 160)
-    const inputRow = (await lines())[filterName.y + 1]!
-    const filterInput = { x: inputRow.lastIndexOf('◉', filterName.x), y: filterName.y + 1 }
+    const inputRow = (await lines())[filterName.y + 3]!
+    const filterInput = { x: inputRow.lastIndexOf('◉', filterName.x), y: filterName.y + 3 }
     expect(inputRow[filterInput.x - 1]).toBe('▶')
 
     // Two refused drops, each saying why on the canvas and making no link.
@@ -85,7 +85,7 @@ describe('logic cards on the canvas', () => {
     let mid2 = await drag({ x: dotX, y: dotY }, { x: yesDot.x + 4, y: yesDot.y })
     expect(mid2).toContain('Outputs link to inputs')
     expect(linksNow()).toBe(count)
-    const doneInput = { x: doneCard.x - 2, y: doneCard.y + 1 }
+    const doneInput = { x: doneCard.x - 2, y: doneCard.y + 2 }
     expect((await lines())[doneInput.y]![doneInput.x]).toBe('◉')
     mid2 = await drag(doneInput, filterInput)
     expect(mid2).toContain('Inputs link to outputs')
@@ -170,9 +170,9 @@ describe('the Model card', () => {
       return mid
     }
     const saved = () => JSON.parse(w.files[FLOW]!)
-    // A Model card's output dot: on its right edge, the row under its name. An agent's model dot: left edge, two rows under its name.
-    const outDot = async (name: string) => { const p = await at(`◈ ${name}`, 26, 160); return { x: p.x + 25, y: p.y + 1 } }
-    const modelDot = async (name: string) => { const p = await at(name, 26, 160); return { x: p.x - 2, y: p.y + 2 } }
+    // A Model card's output dot: on its right edge, in the sockets row two under its name. An agent's model dot: left edge, four under its name.
+    const outDot = async (name: string) => { const p = await at(`◈ ${name}`, 26, 160); return { x: p.x + 25, y: p.y + 2 } }
+    const modelDot = async (name: string) => { const p = await at(name, 26, 160); return { x: p.x - 2, y: p.y + 4 } }
 
     expect((await lines()).join('\n')).toContain('⚠ Link it to an agent')
     expect((await lines())[(await modelDot('Writer')).y]![(await modelDot('Writer')).x]).toBe('○')
@@ -181,21 +181,21 @@ describe('the Model card', () => {
     const writer = await at('Writer', 26, 160)
     await drag(await outDot('Fast'), { x: writer.x + 4, y: writer.y + 1 })
     expect(saved().links).toMatchObject([{ from: 'm', to: 'a' }])
-    expect((await lines()).join('\n')).toContain('◈ haiku-4-5-20251001')
+    expect((await lines()).join('\n')).toContain('model  haiku-4-5-2025')
     expect((await lines())[(await modelDot('Writer')).y]![(await modelDot('Writer')).x]).toBe('◉')
 
     // Refused: a Model card onto an If; another agent's output onto a model dot.
     const ifCard = await at('◇ Done?', 26, 160)
     expect(await drag(await outDot('Fast'), { x: ifCard.x + 4, y: ifCard.y + 1 })).toContain('Only agents take a model')
     const checker = await at('Checker', 26, 160)
-    const checkerOut = { x: checker.x + 25, y: checker.y + 1 }
+    const checkerOut = { x: checker.x + 25, y: checker.y + 3 }
     expect(await drag(checkerOut, await modelDot('Writer'))).toContain('Only a Model card links here')
     expect(saved().links).toHaveLength(1)
 
     // A second Model card replaces the first: an agent runs with one model.
     await drag(await outDot('Deep'), { x: writer.x + 4, y: writer.y + 1 })
     expect(saved().links).toMatchObject([{ from: 'm2', to: 'a' }])
-    expect((await lines()).join('\n')).toContain('◈ opus-5-5 · max')
+    expect((await lines()).join('\n')).toContain('model  opus-5-5 · max')
 
     // The panel lists Opus, Sonnet and Haiku, then the option's ids; an entry that is no model id is named.
     const fast = await at('◈ Fast', 26, 160)
@@ -246,7 +246,7 @@ describe('the Model card', () => {
       agents: [
         card('m', 'model', 'Deep', { model: 'claude-opus-5-5', effort: 'max' }, 0, 0),
         { ...agent('a', 'Writer', '', 40, 0), prompt: 'Write a haiku' },
-        { ...agent('b', 'Plain', '', 40, 12), prompt: 'Say hi' },
+        { ...agent('b', 'Plain', '', 74, 0), prompt: 'Say hi' }, // beside Writer: Writer's drawer hangs below it
       ],
       links: [link('1', 'm', 'a')],
     }, 'canvas-chat')
@@ -274,8 +274,9 @@ describe('the Model card', () => {
     for (const name of ['Writer', 'Plain']) {
       const c = await at(name, 26)
       await click({ x: c.x + 2, y: c.y })
-      const run = await at('[ ▶ Run ]', 160)
-      await click({ x: run.x + 2, y: run.y })
+      const run = await at('[ ▶ Test', 160)
+      await click({ x: run.x + 2, y: run.y }) // the test message box, last message filled in
+      await ui.key({ key: 'return', in: 'canvas' })
       await settle()
     }
     expect(spawned).toHaveLength(2)
@@ -351,7 +352,7 @@ describe('zoom', () => {
     expect((await lines())[ctl.y]).toContain('75%')
     await ui.key({ key: '0', in: 'canvas' })
     expect((await lines())[ctl.y]).toContain('100%')
-    expect((await lines()).join('\n')).toContain('◈ haiku-4-5-20251001') // full cards again
+    expect((await lines()).join('\n')).toContain('model  haiku-4-5-2025') // full cards again
     await ui.unmount()
   })
 })
@@ -455,3 +456,304 @@ describe('the running-chat browser', () => {
     await ui.unmount()
   })
 })
+
+describe('typing in a text box', () => {
+  test('the cursor moves with the arrows, Home and End, up and down a wrapped box, and a click; Ctrl+V and Cmd+V paste at it', async ($, on) => {
+    const w = world(on, { agents: [card('s', 'start', 'Start', {}, 0, 0), agent('a', 'Writer', 'sid-a', 40, 0)], links: [link('1', 's', 'a')] }, 'canvas-chat')
+    on('ui.open', async () => ({ value: { isOpened: true } }) as any)
+    const pane = { isFocused: true }
+    on('ui.panes', async () => ({ value: [{ id: 'agent-flows', title: 'Agent Flows', isShown: true, isPlaced: true, ...pane }] }) as any)
+    // The prompt box itself: the edit made.
+    on('prompt.edit', async (_$: unknown, e: any) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }) as any)
+    on('clock.every', async () => ({ value: undefined }))
+    await ($ as any).command.run({ command: 'flow', args: '' }).catch(() => {})
+    const ui = await $.ui.mount(PANE)
+    await ui.resize({ columns: 200, rows: 40, in: 'canvas' })
+    const lines = async () => (await ui.findAll({ in: 'canvas', type: 'Box' })).slice(1).map(r => r.text)
+    const at = async (text: string, minX = 0) => {
+      const all = await lines()
+      const y = all.findIndex(r => r.indexOf(text, minX) >= 0)
+      if (y < 0) throw new Error(`not on screen: ${text}\n${all.join('\n')}`)
+      return { x: all[y]!.indexOf(text, minX), y }
+    }
+    const click = async (p: { x: number; y: number }) => {
+      await ui.pointer({ type: 'down', ...p, button: 'left', in: 'canvas' })
+      await ui.pointer({ type: 'up', ...p, button: 'left', in: 'canvas' })
+      await settle()
+    }
+    const key = async (k: string, mods: Record<string, true> = {}) => { await ui.key({ key: k, ...mods, in: 'canvas' }); await settle() }
+    const type = async (text: string) => { for (const ch of text) await key(ch === ' ' ? 'space' : ch) }
+    const command = () => JSON.parse(w.files[FLOW]!).agents.find((n: any) => n.id === 's').prompt
+
+    // The Start card's COMMAND box.
+    const start = await at('▶ Start', 26)
+    await click({ x: start.x + 2, y: start.y })
+    const placeholder = await at('What the run begins with', 160)
+    await click(placeholder)
+    await type('helo')
+    await key('left')
+    await type('l') // into the middle
+    await key('end')
+    await type(' world')
+    await key('home')
+    await type('>')
+    expect((await lines()).join('\n')).toContain('>▏hello world')
+
+    // Cmd+V: the clipboard goes in at the cursor.
+    w.clipboard.text = 'PASTED\nTEXT '
+    await key('v', { meta: true })
+    expect((await lines()).join('\n')).toContain('>PASTED TEXT ▏hello world')
+
+    // A click on a letter puts the cursor before it.
+    const row = await at('>PASTED TEXT', 160)
+    await click({ x: row.x + '>PASTED TEXT '.length + 1, y: row.y }) // past the cursor mark, on the "h"
+    await type('X')
+    await key('return')
+    expect(command()).toBe('>PASTED TEXT Xhello world')
+
+    // A wrapped box: up goes to the line above, at the same column.
+    const value = await at('>PASTED TEXT', 160)
+    await click({ x: value.x, y: value.y })
+    await key('end')
+    await type(' and a second line that wraps')
+    await key('up')
+    await key('home')
+    await type('^')
+    await key('return')
+    expect(command()).toBe('^>PASTED TEXT Xhello world and a second line that wraps')
+
+    // Cmd+V is the terminal's: it pastes into Claude's prompt box. While the canvas has the keys, it comes here instead.
+    const promptPaste = async (inputText: string) => {
+      const r = await ($ as any).prompt.edit({ origin: { kind: 'composer' }, text: 'draft', cursor: 5, start: 5, end: 5, inputText })
+      await settle()
+      return r
+    }
+    // With no text box open, the canvas says where to click.
+    expect(await promptPaste('KEEP')).toEqual({ text: 'draft', cursor: 5 })
+    expect((await lines()).join('\n')).toContain('Click a text box to paste into it.')
+    // With one open, the paste goes in at its cursor and the prompt box is left as it was.
+    const box = await at('^>PASTED', 160)
+    await click({ x: box.x, y: box.y })
+    await key('home')
+    expect(await promptPaste('CMD\nV ')).toEqual({ text: 'draft', cursor: 5 })
+    expect((await lines()).join('\n')).toContain('CMD V ▏^>PASTED')
+    // A typed key, or the canvas not holding the keys, is the prompt box's.
+    pane.isFocused = false
+    expect(await promptPaste('ELSEWHERE')).toEqual({ text: 'draftELSEWHERE', cursor: 14 })
+    expect((await lines()).join('\n')).not.toContain('ELSEWHERE')
+    await ui.unmount()
+  })
+})
+
+describe('a text box left without Enter', () => {
+  test("keeps what was typed: Run flow runs the edited command, and a click away saves a card's text", async ($, on) => {
+    const w = world(on, {
+      agents: [{ ...card('s', 'start', 'Start', {}, 0, 0), prompt: 'Find questions' }, agent('a', 'Finder', 'sid-a', 40, 0)],
+      links: [link('1', 's', 'a')],
+    }, 'canvas-chat')
+    on('ui.open', async () => ({ value: { isOpened: true } }) as any)
+    on('clock.every', async () => ({ value: undefined }))
+    await ($ as any).command.run({ command: 'flow', args: '' }).catch(() => {})
+    const ui = await $.ui.mount(PANE)
+    await ui.resize({ columns: 200, rows: 40, in: 'canvas' })
+    const lines = async () => (await ui.findAll({ in: 'canvas', type: 'Box' })).slice(1).map(r => r.text)
+    const at = async (text: string, minX = 0) => {
+      const all = await lines()
+      const y = all.findIndex(r => r.indexOf(text, minX) >= 0)
+      if (y < 0) throw new Error(`not on screen: ${text}\n${all.join('\n')}`)
+      return { x: all[y]!.indexOf(text, minX), y }
+    }
+    const click = async (p: { x: number; y: number }) => {
+      await ui.pointer({ type: 'down', ...p, button: 'left', in: 'canvas' })
+      await ui.pointer({ type: 'up', ...p, button: 'left', in: 'canvas' })
+      await settle()
+    }
+    const type = async (text: string) => {
+      for (const ch of text) await ui.key({ key: ch === ' ' ? 'space' : ch, in: 'canvas' })
+      await settle()
+    }
+    const saved = () => JSON.parse(w.files[FLOW]!).agents.find((n: any) => n.id === 's').prompt
+
+    // Edit the Start card's command, then go straight to Run flow: no Enter.
+    const start = await at('▶ Start', 26)
+    await click({ x: start.x + 2, y: start.y })
+    await click(await at('Find questions', 160))
+    await ui.key({ key: 'end', in: 'canvas' })
+    await type(' and list their links')
+    await click(await at('▶ Run flow', 160))
+    expect((await lines()).join('\n')).toContain('Find questions and list their links')
+    expect(saved()).toBe('Find questions and list their links')
+    await ui.key({ key: 'return', in: 'canvas' })
+    await settle()
+    expect(w.sent.filter(m => m.to.includes('sid-a')).map(m => m.text).join('\n')).toContain('Find questions and list their links')
+
+    // A click on empty canvas also keeps the typing (the box wraps: "links" is its second line).
+    await click(await at('links ', 160))
+    await ui.key({ key: 'end', in: 'canvas' })
+    await type('!')
+    await click({ x: 100, y: 30 })
+    expect(saved()).toBe('Find questions and list their links!')
+    await ui.unmount()
+  })
+})
+
+describe('reading what an agent did', () => {
+  test('a long name wraps on its card; View chat opens its conversation over the canvas; q closes it', async ($, on) => {
+    const w = world(on, { agents: [agent('a', 'help-design-system-flow-agent1', 'sid-a', 0, 0)], links: [] }, 'canvas-chat')
+    const j = (o: unknown) => JSON.stringify(o)
+    w.files['/home/k/.claude/projects/-work-proj/sid-a.jsonl'] = [
+      j({ type: 'user', message: { content: 'Find the newest questions' } }),
+      j({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'slack_read_channel' }] } }),
+      j({ type: 'assistant', message: { content: [{ type: 'text', text: '**3 of the 5** have earlier answers.\nThe Muted Chatter thread was answered by the design systems team last week.' }] } }),
+    ].join('\n')
+    on('ui.open', async () => ({ value: { isOpened: true } }) as any)
+    on('clock.every', async () => ({ value: undefined }))
+    await ($ as any).command.run({ command: 'flow', args: '' }).catch(() => {})
+    const ui = await $.ui.mount(PANE)
+    await ui.resize({ columns: 200, rows: 40, in: 'canvas' })
+    const lines = async () => (await ui.findAll({ in: 'canvas', type: 'Box' })).slice(1).map(r => r.text)
+    const at = async (text: string, minX = 0) => {
+      const all = await lines()
+      const y = all.findIndex(r => r.indexOf(text, minX) >= 0)
+      if (y < 0) throw new Error(`not on screen: ${text}\n${all.join('\n')}`)
+      return { x: all[y]!.indexOf(text, minX), y }
+    }
+    const click = async (p: { x: number; y: number }) => {
+      await ui.pointer({ type: 'down', ...p, button: 'left', in: 'canvas' })
+      await ui.pointer({ type: 'up', ...p, button: 'left', in: 'canvas' })
+      await settle()
+    }
+
+    // The card's name in two lines, broken after a hyphen, not cut in the middle.
+    const screen = (await lines()).join('\n')
+    expect(screen).toMatch(/│ help-design-system- +(⧉ )?│/)
+    expect(screen).toMatch(/│ flow-agent1 +│/)
+
+    // Its panel: View chat; the conversation opens, newest last, read-only.
+    const card = await at('help-design-system-', 26)
+    await click({ x: card.x, y: card.y })
+    // On the card, unselected: the newest text wrapped over its last rows, markdown's ** gone.
+    // Unselected, the card shows its status and a way to its work, not a cut-off line of it.
+    expect(screen).toContain('See response ›')
+    expect(screen).not.toContain('design systems team')
+
+    // Selected: a drawer under the card, wider than it, with the prompt and the newest lines in full.
+    const drawn = (await lines()).join('\n')
+    expect(drawn).toContain('▸ Find the newest questions')
+    expect(drawn).toContain('⚙ slack_read_channel')
+    expect(drawn).toContain('3 of the 5 have earlier answers.')
+    expect(drawn).toContain('View chat (v) for all of it ›')
+    expect(drawn).not.toContain('**')
+    // The side panel keeps to settings: the agent's output lives on the canvas.
+    const side = (await lines()).map(r => r.slice(160)).join('\n')
+    expect(side).not.toContain('LAST ACTIVITY')
+    expect(side).not.toContain('LATEST ANSWER')
+    // Its buttons line up: two to a row, the same width.
+    const grid = (await lines()).map(r => r.slice(160)).filter(r => r.includes('[ ▶ Test') || r.includes('[ Open in tab'))
+    expect(grid).toHaveLength(2)
+    expect(grid[0]!.indexOf('[ View chat')).toBe(grid[1]!.indexOf('[ → Link to…'))
+
+    await click(await at('[ View chat', 160))
+    const view = (await lines()).join('\n')
+    expect(view).toContain('read-only')
+    expect(view).toContain('Find the newest questions')
+    expect(view).toContain('⚙ slack_read_channel')
+    expect(view).toContain('3 of the 5 have earlier answers.')
+    await ui.key({ key: 'q', in: 'canvas' })
+    await settle()
+    expect((await lines()).join('\n')).not.toContain('read-only')
+
+    // The card's See response opens the chat view too.
+    await click(await at('See response ›', 26))
+    expect((await lines()).join('\n')).toContain('read-only')
+    await ui.key({ key: 'q', in: 'canvas' })
+    await settle()
+
+    // A long panel scrolls: ▼ moves on, and PgUp comes back.
+    const panel = (await lines()).join('\n')
+    if (panel.includes(' of ') && panel.includes('PgUp PgDn')) {
+      await click(await at('▼', 160))
+      expect((await lines()).join('\n')).toContain('LATEST ANSWER')
+    }
+    await ui.unmount()
+  })
+})
+
+describe('link notices', () => {
+  test('only agents linked to agents are told; a Model card or a logic card link is set and removed silently', async ($, on) => {
+    const w = world(on, {
+      agents: [card('m', 'model', 'Fast', { model: 'claude-haiku-4-5-20251001' }, 0, 0), agent('a', 'Writer', 'sid-a', 40, 0), card('i', 'if', 'Done?', { check: 'contains', value: 'ok' }, 80, 0)],
+      links: [link('1', 'm', 'a'), link('2', 'a', 'i')],
+    }, 'canvas-chat')
+    on('ui.open', async () => ({ value: { isOpened: true } }) as any)
+    on('clock.every', async () => ({ value: undefined }))
+    await ($ as any).command.run({ command: 'flow', args: '' }).catch(() => {})
+    const ui = await $.ui.mount(PANE)
+    await ui.resize({ columns: 200, rows: 40, in: 'canvas' })
+    const lines = async () => (await ui.findAll({ in: 'canvas', type: 'Box' })).slice(1).map(r => r.text)
+    const handles = async () => {
+      const all = await lines()
+      return all.flatMap((r, y) => [...r.matchAll(/◆/g)].filter(m => m.index! > 26 && m.index! < 160 && r[m.index! + 1] === '─').map(m => ({ x: m.index!, y })))
+    }
+    const click = async (p: { x: number; y: number }) => {
+      await ui.pointer({ type: 'down', ...p, button: 'left', in: 'canvas' })
+      await ui.pointer({ type: 'up', ...p, button: 'left', in: 'canvas' })
+      await settle()
+    }
+    // Delete both links by their ◆ handles.
+    for (let i = 0; i < 2; i++) {
+      const [h] = await handles()
+      await click(h!)
+      await ui.key({ key: 'x', in: 'canvas' })
+      await settle()
+    }
+    expect(JSON.parse(w.files[FLOW]!).links).toHaveLength(0)
+    expect(w.sent.filter(m => m.text.includes('[Agent Flows · notice]'))).toEqual([])
+    await ui.unmount()
+  })
+})
+
+describe('opening an agent that is already open', () => {
+  const setup = async ($: any, on: any, env: Record<string, string>) => {
+    const w = world(on, { agents: [agent('a', 'Writer', 'sid-a', 40, 0)], links: [] }, 'canvas-chat', [], env)
+    // The chat runs as pid 100, in terminal ttys100, shown by one cmux tab.
+    w.cmux.tree = [
+      '├── workspace workspace:3 AAAA "Agents"',
+      '│   └── pane pane:4 BBBB',
+      '│       ├── surface surface:7 C7899D9A-9003-4163-AD54-9D29B70CAD1F [terminal] "✳ Writer" tty=ttys100',
+      '│       └── surface surface:8 D0000000-0000-4000-8000-000000000000 [terminal] "other" tty=ttys1000',
+    ].join('\n')
+    on('ui.open', async () => ({ value: { isOpened: true } }) as any)
+    on('clock.every', async () => ({ value: undefined }))
+    await $.command.run({ command: 'flow', args: '' }).catch(() => {})
+    const ui = await $.ui.mount(PANE)
+    await ui.resize({ columns: 200, rows: 40, in: 'canvas' })
+    const lines = async () => (await ui.findAll({ in: 'canvas', type: 'Box' })).slice(1).map((r: any) => r.text)
+    const click = async (text: string, minX: number) => {
+      const all = await lines()
+      const y = all.findIndex((r: string) => r.indexOf(text, minX) >= 0)
+      const x = all[y]!.indexOf(text, minX)
+      await ui.pointer({ type: 'down', x: x + 2, y, button: 'left', in: 'canvas' })
+      await ui.pointer({ type: 'up', x: x + 2, y, button: 'left', in: 'canvas' })
+      await settle()
+    }
+    await click('Writer', 26)
+    await click('[ Open in tab', 160)
+    return { w, ui }
+  }
+
+  test('in cmux it switches to the tab the chat runs in', async ($, on) => {
+    const { w, ui } = await setup($, on, { CMUX_BUNDLED_CLI_PATH: '/cmux' })
+    expect(w.cmux.ran).toContainEqual(['surface', 'open', 'local/terminal/C7899D9A-9003-4163-AD54-9D29B70CAD1F', '--focus', 'true'])
+    expect(w.toasts.filter(t => t.includes('already open'))).toEqual([])
+    await ui.unmount()
+  })
+
+  test('elsewhere it says the chat is open, and opens no second copy', async ($, on) => {
+    const { w, ui } = await setup($, on, {})
+    expect(w.toasts.some(t => t.includes('"Writer" is already open'))).toBe(true)
+    expect(w.cmux.ran).toEqual([])
+    await ui.unmount()
+  })
+})
+

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { cardHeight, check, isModelId, migrateV1, modelArgs, modelChoices, modelFor, newCard, nextAgentName, pickBranch, portsOf, reachableAgents, summaryOf, warningsOf } from '../hooks/cards'
+import { cardHeight, check, fillPrompt, isModelId, migrateV1, modelArgs, modelChoices, modelFor, newCard, nextAgentName, pickBranch, portsOf, reachableAgents, summaryOf, warningsOf } from '../hooks/cards'
 import { parseFlow, slug } from '../hooks/store'
 import type { FlowEdge, FlowNode } from '../types'
 import { FLOW, ROOT, agent, card, head, link, sentTo, settle, turn, world } from './world'
@@ -16,7 +16,7 @@ describe('cards on their own', () => {
     expect(portsOf({ kind: 'loop' })).toEqual(['done', 'again'])
     expect(portsOf({ kind: 'end' })).toEqual([])
     expect(portsOf({})).toEqual(['out'])
-    expect(cardHeight({ kind: 'switch', card: { branches: ['a', 'b', 'c'] } })).toBe(8)
+    expect(cardHeight({ kind: 'switch', card: { branches: ['a', 'b', 'c'] } })).toBe(12)
   })
 
   test('If checks plain English with Claude, or text; an unclear answer is null', async () => {
@@ -383,5 +383,20 @@ describe("the Model card's list", () => {
     })
     for (const id of ['opus', 'anthropic/claude-haiku-4-5', 'claude-sonnet-4@20250514']) expect(isModelId(id)).toBe(true)
     for (const id of ['--dangerously-skip-permissions', '-m', 'a b', '', '/etc/passwd']) expect(isModelId(id)).toBe(false)
+  })
+})
+
+describe('Prompt card', () => {
+  const vars = { message: 'France, United Kingdom', from: 'Lister' }
+  test('{{message}} and {{from}} go where they are written', () => {
+    expect(fillPrompt('From {{from}}: {{message}}. Keep the United ones.', vars)).toBe('From Lister: France, United Kingdom. Keep the United ones.')
+  })
+  test('a plain sentence keeps the message: it comes under the sentence', () => {
+    expect(fillPrompt('Keep only the countries with United in their names.', vars)).toBe('Keep only the countries with United in their names.\n\nFrance, United Kingdom')
+    expect(fillPrompt('Reply to {{from}} in one line.', vars)).toBe('Reply to Lister in one line.\n\nFrance, United Kingdom')
+  })
+  test('an empty prompt passes the message on as it is', () => {
+    expect(fillPrompt('', vars)).toBe('France, United Kingdom')
+    expect(fillPrompt('   ', vars)).toBe('France, United Kingdom')
   })
 })

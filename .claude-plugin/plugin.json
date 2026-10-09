@@ -1,6 +1,6 @@
 {
   "name": "agent-flows",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Agent Flows: build flows of linked Claude agents (loops, pipelines, reviewer pairs) on a canvas, saved per project",
   "author": { "name": "Keith Vaz", "url": "https://github.com/bamboozledkitty" },
   "homepage": "https://github.com/bamboozledkitty/agent-flows",

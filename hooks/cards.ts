@@ -39,18 +39,22 @@ export function portsOf(n: Pick<FlowNode, 'kind' | 'card'>): string[] {
 export const portLabel = (port: string) =>
   ({ out: 'Out', yes: 'Yes', no: 'No', other: 'Other', done: 'Done', again: 'Again' })[port] ?? port
 
-/** Rows a card takes on the canvas: name, summary, then one row per named output. */
+/**
+ * Rows a card takes on the canvas, in bands: title, sockets (input and output),
+ * body; an agent adds its model, status and button, and named outputs a row each.
+ */
 export function cardHeight(n: Pick<FlowNode, 'kind' | 'card'>): number {
   const ports = portsOf(n)
-  return ports.length > 1 ? 3 + ports.length + 1 : 6
+  if (isAgent(n)) return 10
+  return ports.length > 1 ? 8 + ports.length : 7
 }
 
-/** The row, from the card's top, a link from `port` leaves at. */
+/** The row, from the card's top, a link from `port` leaves at: the sockets row, or a named output's own. */
 export function portRow(n: Pick<FlowNode, 'kind' | 'card'>, port: string): number {
   const ports = portsOf(n)
-  if (ports.length <= 1) return 2
+  if (ports.length <= 1) return isAgent(n) ? 4 : 3
   const i = ports.indexOf(port)
-  return 3 + (i < 0 ? 0 : i)
+  return 7 + (i < 0 ? 0 : i)
 }
 
 /**
@@ -72,7 +76,7 @@ export function newCard(kind: CardKind, id: string, x: number, y: number, agentN
     case 'switch': return { ...base, kind, name: 'Switch', card: { branches: ['A', 'B'] } }
     case 'all': return { ...base, kind, name: 'And' }
     case 'first': return { ...base, kind, name: 'Or' }
-    case 'prompt': return { ...base, kind, name: 'Prompt', card: { template: '{{message}}' } }
+    case 'prompt': return { ...base, kind, name: 'Prompt', card: { template: '' } }
     case 'loop': return { ...base, kind, name: 'Loop until', card: { check: 'judge', value: '', maxTries: 3 } }
     case 'end': return { ...base, kind, name: 'End', card: { saveTo: '' } }
     case 'note': return { ...base, kind, name: 'Note', card: { text: '' } }
@@ -123,8 +127,16 @@ export async function pickBranch(branches: string[], text: string, ask: Ask): Pr
   return branches.find(b => b.toLowerCase() === said) ?? branches.find(b => said.startsWith(b.toLowerCase())) ?? 'other'
 }
 
-export const fillPrompt = (template: string, vars: { message: string; from: string }) =>
-  template.replaceAll('{{message}}', vars.message).replaceAll('{{from}}', vars.from)
+/**
+ * A Prompt card's rewrite: `{{message}}` (what came in) and `{{from}}` (who sent
+ * it) filled in. With no `{{message}}`, the message comes under the sentence, so
+ * a plain instruction never drops what it was given.
+ */
+export function fillPrompt(template: string, vars: { message: string; from: string }): string {
+  if (!template.trim()) return vars.message
+  const filled = template.replaceAll('{{message}}', vars.message).replaceAll('{{from}}', vars.from)
+  return template.includes('{{message}}') ? filled : `${filled}\n\n${vars.message}`
+}
 
 /** And's combined message: each input's answer under its agent's name. */
 export const combine = (entries: { from: string; text: string }[]) =>
@@ -145,7 +157,7 @@ export function summaryOf(n: FlowNode, inputs: number): string {
     case 'switch': return `${(c.branches ?? []).length} branches`
     case 'all': return `waits for all ${inputs}`
     case 'first': return `first of ${inputs}`
-    case 'prompt': return (c.template ?? '').split('\n')[0] || 'Write the prompt'
+    case 'prompt': return (c.template ?? '').split('\n')[0] || 'Passes the message on'
     case 'loop': return `${checkText()} · ${c.maxTries ?? 3} tries`
     case 'end': return c.saveTo ? `saves to ${c.saveTo}` : 'The final answer'
     case 'note': return (c.text ?? '').split('\n')[0] || 'Write a note'

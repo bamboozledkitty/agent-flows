@@ -10,6 +10,7 @@ import {
   isAgent,
   isModelId,
   kindOf,
+  MODEL_ALIASES,
   modelArgs,
   modelChoices,
   modelFor,
@@ -25,14 +26,19 @@ import {
 import {
   applyLive,
   CARD,
+  composeInstructions,
   fillTemplate,
+  instructionRefs,
   matchRecipient,
+  parseChat,
   parseStreamLine,
   parseTranscript,
   peerSection,
   previewOf,
+  resolveRef,
   shellQuote,
   startLive,
+  surfaceForTty,
 } from './flow'
 import {
   fileFor,
@@ -47,10 +53,13 @@ import {
   syncIndex,
 } from './store'
 import { chatsUnder, folderRows, parentOf, resolveDir, showPath } from './picker'
+import type { RefFile } from './flow'
 import type { Io } from './store'
 import type {
   AvailableSession,
+  CanvasBatch,
   CanvasMessage,
+  ChatView,
   CanvasProps,
   CardConfig,
   CardKind,
@@ -83,6 +92,24 @@ const portA = atom({ plugin: 'agent-flows', key: 'connectPort' } as const, 'out'
 const resultsA = atom({ plugin: 'agent-flows', key: 'results' } as const, {} as Record<string, { text: string; at: number }>)
 const waitingA = atom({ plugin: 'agent-flows', key: 'waiting' } as const, {} as Record<string, { got: number; of: number }>)
 const modelsA = atom({ plugin: 'agent-flows', key: 'models' } as const, null as ModelList | null)
+const pasteA = atom({ plugin: 'agent-flows', key: 'paste' } as const, null as { seq: number; text: string } | null)
+const chatA = atom({ plugin: 'agent-flows', key: 'chat' } as const, null as ChatView | null)
+
+/** The last message taken in, per canvas: `sender` is the canvas's, fresh each time it loads. */
+const lastSeq = new Map<string, number>()
+
+/**
+ * The canvas's messages in a post not yet taken in. A post the canvas makes in the
+ * same frame as another replaces it, so each post carries the last few, numbered.
+ */
+function unseen(data: unknown): CanvasMessage[] {
+  const b = data as CanvasBatch | null
+  if (b?.t !== 'batch' || typeof b.sender !== 'string' || !Array.isArray(b.items)) return []
+  const after = lastSeq.get(b.sender) ?? 0
+  const fresh = b.items.filter(i => typeof i?.seq === 'number' && i.seq > after).sort((x, y) => x.seq - y.seq)
+  if (fresh.length) lastSeq.set(b.sender, fresh[fresh.length - 1]!.seq)
+  return fresh.map(i => i.m)
+}
 
 const IDLE: NodeRun = { status: 'idle', preview: [], lastOutput: '' }
 
@@ -365,7 +392,7 @@ async function runNode($: EngineInterface, id: string, prompt: string, hop = 0, 
     const at = Date.now()
     if (!now && at - shownAt < PREVIEW_MS) return
     shownAt = at
-    await setRun($, id, r => ({ ...r, preview: previewOf(liveView) }))
+    await setRun($, id, r => ({ ...r, preview: previewOf(liveView), thinking: liveView.thinking }))
   }
 
   // AGENT_FLOWS_CHILD: the child leaves handing its reply on to this window.
@@ -486,7 +513,7 @@ async function enter($: EngineInterface, flow: FlowDoc, edge: FlowEdge, msg: Msg
         await log($, `⟲ → ${card.name} stopped: the link's max passes (${edge.maxPasses}) reached in this run`)
         return
       }
-      const body = msg.raw ? msg.text : fillTemplate(edge.template, { output: msg.text, from: msg.from })
+      const body = await withInstructions($, flow, card, msg.raw ? msg.text : fillTemplate(edge.template, { output: msg.text, from: msg.from }))
       await log($, `→ ${msg.from} → ${card.name}`)
       void runNode($, card.id, `${hopTag(msg.run, msg.hop + 1)}\n${body}`, msg.hop + 1, msg.run).catch(err =>
         log($, `⚠ couldn't hand off to ${card.name}: ${String(err)}`),
@@ -607,6 +634,8 @@ async function judge($: EngineInterface, prompt: string) {
 // Chats opened in a tab write only their transcript, so the canvas follows them by
 // reading its tail. Runs the canvas started stream instead.
 const WATCH_MS = 2000
+/** How often a running chat's transcript (and an open chat view's) is checked for news. */
+const ACTIVE_MS = 500
 /** How often a background run's card is redrawn while its reply streams in. */
 const PREVIEW_MS = 250
 const STALE_MS = 120000
@@ -616,7 +645,10 @@ const lastSeen = new Map<string, string>()
 const missedAt = new Map<string, number>()
 const MISS_RETRY_MS = 30000
 let watcher: { cancel(): void } | null = null
+let quickWatcher: { cancel(): void } | null = null
 let isWatching = false
+/** A full tick found a quick one going: the next quick tick steps aside for it. */
+let fullPending = false
 
 async function findTranscript($: EngineInterface, sessionId: string) {
   const cached = transcriptPath.get(sessionId)
@@ -632,7 +664,9 @@ async function findTranscript($: EngineInterface, sessionId: string) {
 
 /** One watcher tick: flow files changed elsewhere, open chats, and every agent's latest turn. */
 async function watch($: EngineInterface) {
-  if (isWatching) return // the last tick is still going
+  // The last tick is still going: a quick one yields to this one next time.
+  if (isWatching) return void (fullPending = true)
+  fullPending = false
   isWatching = true
   try {
     await watchOnce($)
@@ -660,6 +694,59 @@ async function watchOnce($: EngineInterface) {
       if (view) await setRun($, node.id, r => ({ ...r, ...view }))
     }
   }
+}
+
+/**
+ * The quick tick, between full ones: a chat with a turn going, and the chat being
+ * read on the canvas, are re-read as soon as their transcript changes.
+ */
+async function watchActive($: EngineInterface) {
+  if (isWatching || fullPending) return
+  isWatching = true
+  try {
+    const runs = await read($, runsA)
+    for (const flow of Object.values(await read($, flowsA))) {
+      for (const node of flow.nodes) {
+        if (!node.sessionId || live.has(node.id) || runs[node.id]?.status !== 'running') continue
+        const path = await findTranscript($, node.sessionId)
+        if (!path) continue
+        const stat = await $.fs.stat(path)
+        const sig = `${stat.mtimeMs}:${stat.size}`
+        if (lastSeen.get(node.id) === sig) continue
+        lastSeen.set(node.id, sig)
+        const tail = await $.process.run(['tail', '-n', '300', path])
+        const view = parseTranscript(tail.stdout, false)
+        if (view) await setRun($, node.id, r => ({ ...r, ...view }))
+      }
+    }
+    const chat = await read($, chatA)
+    if (chat) await loadChat($, chat.id, true)
+  } finally {
+    isWatching = false
+  }
+}
+
+/** The chat view's transcript, as last read: re-read only once it changes. */
+let chatSeen = ''
+
+/** Reads an agent's chat into the chat view; `ifChanged` skips an unchanged transcript. */
+async function loadChat($: EngineInterface, id: string, ifChanged = false) {
+  const found = await locate($, id)
+  if (!found || !isAgent(found.node)) return void (await update($, chatA, () => null))
+  const { node } = found
+  const status = (await read($, runsA))[id]?.status ?? 'idle'
+  // A re-read for the open view (`ifChanged`) never brings back one closed, or
+  // replaced by another agent's, while it read.
+  const put = async (view: ChatView) => update($, chatA, cur => (ifChanged && cur?.id !== id ? cur : view))
+  const path = node.sessionId ? await findTranscript($, node.sessionId) : null
+  const stat = path ? await $.fs.stat(path) : null
+  const sig = `${id}:${stat ? `${stat.mtimeMs}:${stat.size}` : node.sessionId ? 'none' : 'new'}:${status}`
+  if (ifChanged && sig === chatSeen) return
+  chatSeen = sig
+  if (!node.sessionId) return void (await put({ id, name: node.name, lines: [], status, note: 'No chat yet: it starts on its first run.' }))
+  if (!path) return void (await put({ id, name: node.name, lines: [], status, note: "This chat hasn't said anything yet." }))
+  const tail = await $.process.run(['tail', '-n', '1500', path])
+  await put({ id, name: node.name, lines: parseChat(tail.stdout), status })
 }
 
 /** For the open flow: each End card's latest answer (raising Run finished once), and And's progress. */
@@ -704,7 +791,7 @@ async function watchRuns($: EngineInterface) {
  * Claude chats running on this machine, from the registry each one keeps at
  * ~/.claude/sessions/<pid>.json; entries whose process has ended are left out.
  */
-async function runningSessions($: EngineInterface): Promise<AvailableSession[]> {
+async function runningSessions($: EngineInterface): Promise<(AvailableSession & { pid: number })[]> {
   const dir = `${await home($)}/.claude/sessions`
   const files = (await $.fs.list(dir).catch(() => [])).filter(f => f.kind === 'file' && /^\d+\.json$/.test(f.name))
   const found: (AvailableSession & { pid: number })[] = []
@@ -724,7 +811,6 @@ async function runningSessions($: EngineInterface): Promise<AvailableSession[]> 
   return found
     .filter(s => alive.has(s.pid))
     .sort((a, b) => b.startedAt - a.startedAt)
-    .map(({ pid: _pid, ...s }) => s)
 }
 
 async function refreshLive($: EngineInterface) {
@@ -745,7 +831,8 @@ async function openPicker($: EngineInterface) {
     // An entry whose flow file was removed outside the canvas no longer holds the chat.
     const entry = index[s.sessionId]
     if (entry && (await fs.exists(entry.flowFile))) continue
-    choices.push(s)
+    const { pid: _pid, ...chat } = s
+    choices.push(chat)
   }
   pickerChoices = choices
   await browseTo($, await $.session.root())
@@ -823,6 +910,18 @@ async function stop($: EngineInterface, id: string) {
   if (it?.return) await it.return()
 }
 
+/** Switches cmux to the tab running process `pid`; false outside cmux, or when no tab shows it. */
+async function focusTab($: EngineInterface, pid: number) {
+  const cmux = await $.env.get('CMUX_BUNDLED_CLI_PATH')
+  if (!cmux) return false
+  const tty = await $.process.run(['ps', '-o', 'tty=', '-p', String(pid)]).catch(() => null)
+  const tree = await $.process.run([cmux, 'tree', '--all', '--id-format', 'both']).catch(() => null)
+  const surface = tty && tree?.exitCode === 0 ? surfaceForTty(tree.stdout, tty.stdout) : null
+  if (!surface) return false
+  const r = await $.process.run([cmux, 'surface', 'open', `local/terminal/${surface}`, '--focus', 'true']).catch(() => null)
+  return r?.exitCode === 0
+}
+
 /** Opens the agent's real chat, interactive, in a new terminal tab. */
 async function openSession($: EngineInterface, id: string) {
   const found = await locate($, id)
@@ -830,8 +929,11 @@ async function openSession($: EngineInterface, id: string) {
   const session = await ensureSession($, id)
   if (!session) return
   const { node } = found
-  if ((await runningSessions($)).some(s => s.sessionId === session.sessionId)) {
-    $.ui.toast(`"${node.name}" is already open in another tab. Switch to that tab to use it.`)
+  const open = (await runningSessions($)).find(s => s.sessionId === session.sessionId)
+  if (open) {
+    // Already running in a tab: bring that tab forward rather than start a second copy.
+    if (await focusTab($, open.pid)) return void (await log($, `⧉ switched to ${node.name}`))
+    $.ui.toast(`"${node.name}" is already open in another tab or window. Switch to it to use it.`)
     return
   }
   if (live.has(id)) $.ui.toast(`${node.name} is running; wait for it to finish before typing in it.`)
@@ -868,7 +970,8 @@ async function openSession($: EngineInterface, id: string) {
 async function announce($: EngineInterface, flow: FlowDoc, edge: FlowEdge, isConnected: boolean) {
   const a = flow.nodes.find(n => n.id === edge.from)
   const b = flow.nodes.find(n => n.id === edge.to)
-  if (!a || !b || a.id === b.id) return
+  // Only chats talk to chats: a Model card's or a logic card's link is wiring, not a contact.
+  if (!a || !b || a.id === b.id || !isAgent(a) || !isAgent(b)) return
   const tell = async (self: FlowNode, other: FlowNode, canSend: boolean) => {
     if (!self.sessionId) return
     const text = isConnected
@@ -879,6 +982,11 @@ async function announce($: EngineInterface, flow: FlowDoc, edge: FlowEdge, isCon
   await Promise.all([tell(a, b, true), tell(b, a, false)])
 }
 
+/** Text pasted for the canvas's open text box, which holds one line. */
+async function handPaste($: EngineInterface, text: string) {
+  await update($, pasteA, p => ({ seq: (p?.seq ?? 0) + 1, text: text.replace(/[\r\n\t]+/g, ' ').slice(0, 20000) }))
+}
+
 /** The plugin's "Extra models" option, set when the module loads. */
 let extraModels = ''
 
@@ -887,6 +995,18 @@ async function loadModels($: EngineInterface) {
   const { ids, bad } = modelChoices(extraModels)
   const note = bad.length ? `Left out of "Extra models", not a model id: ${bad.join(', ').slice(0, 80)}` : undefined
   await update($, modelsA, () => ({ ids, ...(note ? { note } : {}) }))
+}
+
+/**
+ * The model id a request names for a Model card's choice. A request takes no alias
+ * (`--model` resolves those; a request is sent as named), so `opus`, `sonnet` and
+ * `haiku` become that family's
+ * first id among the "Extra models" option; null when it names none.
+ */
+async function requestModel($: EngineInterface, model: string): Promise<string | null> {
+  if (!MODEL_ALIASES.includes(model)) return model
+  if (!(await read($, modelsA))) await loadModels($) // once per chat
+  return (await read($, modelsA))?.ids.find(id => id.includes(`-${model}`)) ?? null
 }
 
 const isModelCard = (g: Graph, id: string) => g.nodes.some(n => n.id === id && kindOf(n) === 'model')
@@ -959,15 +1079,38 @@ async function deleteSelection($: EngineInterface) {
   await update($, selA, () => ({ kind: 'none' }))
 }
 
-async function startRun($: EngineInterface, id: string) {
+/** ▶ Run on one agent: its test message (`prompt`, kept for next time), with its instructions. */
+async function startRun($: EngineInterface, id: string, prompt?: string) {
   const found = await locate($, id)
   if (!found) return
-  if (!found.node.prompt.trim()) {
-    $.ui.toast(`Give "${found.node.name}" a starting prompt first.`)
+  const message = (prompt ?? found.node.prompt).trim()
+  if (!message) {
+    $.ui.toast(`Write a test message for "${found.node.name}" first.`)
     return
   }
+  if (prompt !== undefined) await patchNode($, id, { prompt: prompt.slice(0, 20000) })
   const run = newRunId()
-  void runNode($, id, `${hopTag(run, 0)}\n${found.node.prompt}`, 0, run).catch(err => log($, `⚠ ${found.node.name}: ${String(err)}`))
+  const body = await withInstructions($, found.flow, found.node, message)
+  void runNode($, id, `${hopTag(run, 0)}\n${body}`, 0, run).catch(err => log($, `⚠ ${found.node.name}: ${String(err)}`))
+}
+
+/** A message with the agent's instructions ahead of it, each `@path` read in; problems go to the log. */
+async function withInstructions($: EngineInterface, flow: FlowDoc, node: FlowNode, body: string) {
+  const text = (node.instructions ?? '').trim()
+  if (!text) return body
+  const root = projectOf(flow)
+  const cwd = node.cwd ?? root
+  const homeDir = await home($)
+  const files: Record<string, RefFile> = {}
+  for (const ref of instructionRefs(text)) {
+    const path = resolveRef(ref, homeDir, root, cwd)
+    files[ref] = !path
+      ? { error: 'only files in the project, or .md files in ~/.claude' }
+      : await $.fs.read(path).then(content => ({ path, content }), () => ({ error: 'no such file' }))
+  }
+  const composed = composeInstructions(node.name, text, files)
+  for (const p of composed.problems) await log($, `⚠ ${node.name}: ${p}`)
+  return `${composed.text}\n\n${body}`
 }
 
 /**
@@ -1132,6 +1275,92 @@ const flowStatus = (nodes: FlowNode[], runs: Record<string, NodeRun>): RunStatus
   return STATUS_RANK.find(s => ss.includes(s)) ?? 'idle'
 }
 
+/** One message from the canvas. */
+async function onCanvas($: EngineInterface, m: CanvasMessage) {
+  switch (m?.t) {
+    case 'select':
+      await update($, selA, () => m.sel)
+      if (m.sel.kind === 'node' && !(await read($, modelsA))) {
+        const sel = m.sel
+        const picked = Object.values(await read($, flowsA)).flatMap(f => f.nodes).find(n => n.id === sel.id)
+        if (picked && kindOf(picked) === 'model') void loadModels($).catch(() => {})
+      }
+      break
+    case 'models': void loadModels($).catch(() => {}); break
+    case 'chat':
+      chatSeen = ''
+      if (typeof m.id === 'string') await loadChat($, m.id)
+      else await update($, chatA, () => null)
+      break
+    case 'paste': {
+      // Plugins can't read the clipboard; macOS's pbpaste can. Text boxes hold one line.
+      const r = await $.process.run(['pbpaste'], { timeoutMs: 5000 }).catch(() => null)
+      const text = r && r.exitCode === 0 ? r.stdout : ''
+      if (!text) $.ui.toast(r ? 'The clipboard has no text to paste.' : "Couldn't read the clipboard.")
+      await handPaste($, text)
+      break
+    }
+    case 'move': await patchNode($, m.id, { x: Math.round(m.x), y: Math.round(m.y) }); break
+    case 'open': await openSession($, m.id); break
+    case 'connect': await connect($, m.from, m.to, typeof m.port === 'string' ? m.port : await read($, portA)); break
+    case 'relink': await relink($, m.id, m.to); break
+    case 'connect-start':
+      await update($, portA, () => (typeof m.port === 'string' ? m.port : 'out'))
+      await update($, connectA, () => m.id)
+      break
+    case 'cancel': await update($, connectA, () => null); break
+    case 'new': await addNode($, m.x, m.y, KIND_SET.has(m.kind as CardKind) ? (m.kind as CardKind) : 'agent'); break
+    case 'delete': await deleteSelection($); break
+    case 'run': await startRun($, m.id, typeof m.prompt === 'string' ? m.prompt : undefined); break
+    case 'node': {
+      const p = m.patch
+      const patch: Partial<FlowNode> = {}
+      if (typeof p.name === 'string' && p.name.trim()) patch.name = p.name.trim().slice(0, 60)
+      if (typeof p.prompt === 'string') patch.prompt = p.prompt.slice(0, 20000)
+      if (typeof p.instructions === 'string') patch.instructions = p.instructions.slice(0, 20000)
+      if (p.mode === 'default' || p.mode === 'acceptEdits' || p.mode === 'plan') patch.mode = p.mode
+      await patchNode($, m.id, patch)
+      break
+    }
+    case 'stop': await stop($, m.id); break
+    case 'fresh':
+      lastSeen.delete(m.id)
+      await patchNode($, m.id, { sessionId: undefined })
+      await setRun($, m.id, () => IDLE)
+      break
+    case 'picker':
+      if (m.open) await openPicker($)
+      else await update($, pickerA, () => null)
+      break
+    case 'picker-dir': if (typeof m.dir === 'string' && (await read($, pickerA))) await browseTo($, m.dir.slice(0, 1000)); break
+    case 'adopt': await adopt($, m.sessionId, m.name, typeof m.cwd === 'string' ? m.cwd : '', m.x, m.y); break
+    case 'edge': {
+      const p = m.patch
+      const patch: Partial<FlowEdge> = {}
+      if (typeof p.maxPasses === 'number') patch.maxPasses = Math.max(1, Math.min(50, Math.round(p.maxPasses)))
+      await patchEdge($, m.id, patch)
+      break
+    }
+    case 'flow-new': await newFlow($); break
+    case 'flow-open':
+      await update($, openA, () => m.id)
+      await update($, selA, () => ({ kind: 'none' }))
+      await update($, connectA, () => null)
+      break
+    case 'flow-patch':
+      if (typeof m.patch.name === 'string' && m.patch.name.trim()) {
+        const name = m.patch.name.trim().slice(0, 60)
+        await mutateFlow($, m.id, f => ({ ...f, name }))
+      }
+      break
+    case 'flow-run': await runFlow($, m.id, typeof m.command === 'string' ? m.command : undefined, typeof m.startId === 'string' ? m.startId : undefined); break
+    case 'card': await patchCard($, m.id, m.patch); break
+    case 'all-flush': await flushAll($, m.id); break
+    case 'flow-stop': await stopFlow($, m.id); break
+    case 'flow-delete': await deleteFlow($, m.id); break
+  }
+}
+
 export const register: Register = (on, options) => {
   extraModels = String(options.extraModels ?? '')
   // Installed for every chat, so starting up stays cheap: register /flow, nothing else.
@@ -1145,6 +1374,10 @@ export const register: Register = (on, options) => {
     if (e.id === PANE) {
       watcher?.cancel()
       watcher = null
+      quickWatcher?.cancel()
+      quickWatcher = null
+      chatSeen = ''
+      await update($, chatA, () => null)
     }
     return next(e)
   })
@@ -1177,6 +1410,17 @@ export const register: Register = (on, options) => {
       void handOff($, found.flow, found.self, e.answer, turnHop, turnRun).catch(err => log($, `⚠ hand-off failed: ${String(err)}`))
     }
     return result
+  })
+
+  // An agent's Model card, in its chat however it runs: open in a tab, or in the
+  // background. Each request names the card's model from then on, so a card linked
+  // or changed while the chat is open takes effect on its next message, and the
+  // person's saved default (what /model would change) is never touched.
+  on('turn.step', async function* ($, e, next) {
+    const found = e.agentId ? null : await selfNode($).catch(() => null)
+    const choice = found ? modelFor(found.flow, found.self.id) : null
+    const model = choice && (await requestModel($, choice.model))
+    return yield* next(choice && model ? { ...e, model, ...(choice.effort ? { effort: choice.effort } : {}) } : e)
   })
 
   // A peer's message is counted as it arrives, whether or not a prompt event carries it.
@@ -1214,82 +1458,29 @@ export const register: Register = (on, options) => {
     watcher ??= $.clock.every(WATCH_MS, () => {
       void watch($).catch(() => {})
     })
+    quickWatcher ??= $.clock.every(ACTIVE_MS, () => {
+      void watchActive($).catch(() => {})
+    })
     await $.ui.open({ id: PANE, title: 'Agent Flows', focus: true, rows: 40, columns: 160 })
     const n = Object.keys(await read($, flowsA)).length
     return { text: `Agent Flows open: ${n} flow${n === 1 ? '' : 's'} in ${await $.session.root()}.` }
   })
 
+  // Cmd+V is the terminal's own: it pastes into the prompt box even while the canvas
+  // has the keys. While the canvas has them, it goes there instead, into the text
+  // box being typed in (none open, the canvas says so). The canvas posts nothing to
+  // say a box is open: a post in the same frame as another replaces it.
+  on('prompt.edit', async ($, e, next) => {
+    if (e.key || !e.inputText) return next(e)
+    const pane = (await $.ui.panes()).find(p => p.id === PANE)
+    if (!pane?.isFocused) return next(e)
+    await handPaste($, e.inputText)
+    return { text: e.text, cursor: e.cursor }
+  })
+
   on('ui.message', async ($, e, next) => {
     if (e.requestId !== PANE || e.element !== 'canvas') return next(e)
-    const m = e.data as CanvasMessage
-    switch (m?.t) {
-      case 'select':
-        await update($, selA, () => m.sel)
-        if (m.sel.kind === 'node' && !(await read($, modelsA))) {
-          const sel = m.sel
-          const picked = Object.values(await read($, flowsA)).flatMap(f => f.nodes).find(n => n.id === sel.id)
-          if (picked && kindOf(picked) === 'model') void loadModels($).catch(() => {})
-        }
-        break
-      case 'models': void loadModels($).catch(() => {}); break
-      case 'move': await patchNode($, m.id, { x: Math.round(m.x), y: Math.round(m.y) }); break
-      case 'open': await openSession($, m.id); break
-      case 'connect': await connect($, m.from, m.to, typeof m.port === 'string' ? m.port : await read($, portA)); break
-      case 'relink': await relink($, m.id, m.to); break
-      case 'connect-start':
-        await update($, portA, () => (typeof m.port === 'string' ? m.port : 'out'))
-        await update($, connectA, () => m.id)
-        break
-      case 'cancel': await update($, connectA, () => null); break
-      case 'new': await addNode($, m.x, m.y, KIND_SET.has(m.kind as CardKind) ? (m.kind as CardKind) : 'agent'); break
-      case 'delete': await deleteSelection($); break
-      case 'run': await startRun($, m.id); break
-      case 'node': {
-        const p = m.patch
-        const patch: Partial<FlowNode> = {}
-        if (typeof p.name === 'string' && p.name.trim()) patch.name = p.name.trim().slice(0, 60)
-        if (typeof p.prompt === 'string') patch.prompt = p.prompt.slice(0, 20000)
-        if (p.mode === 'default' || p.mode === 'acceptEdits' || p.mode === 'plan') patch.mode = p.mode
-        await patchNode($, m.id, patch)
-        break
-      }
-      case 'stop': await stop($, m.id); break
-      case 'fresh':
-        lastSeen.delete(m.id)
-        await patchNode($, m.id, { sessionId: undefined })
-        await setRun($, m.id, () => IDLE)
-        break
-      case 'picker':
-        if (m.open) await openPicker($)
-        else await update($, pickerA, () => null)
-        break
-      case 'picker-dir': if (typeof m.dir === 'string' && (await read($, pickerA))) await browseTo($, m.dir.slice(0, 1000)); break
-      case 'adopt': await adopt($, m.sessionId, m.name, typeof m.cwd === 'string' ? m.cwd : '', m.x, m.y); break
-      case 'edge': {
-        const p = m.patch
-        const patch: Partial<FlowEdge> = {}
-        if (typeof p.maxPasses === 'number') patch.maxPasses = Math.max(1, Math.min(50, Math.round(p.maxPasses)))
-        await patchEdge($, m.id, patch)
-        break
-      }
-      case 'flow-new': await newFlow($); break
-      case 'flow-open':
-        await update($, openA, () => m.id)
-        await update($, selA, () => ({ kind: 'none' }))
-        await update($, connectA, () => null)
-        break
-      case 'flow-patch':
-        if (typeof m.patch.name === 'string' && m.patch.name.trim()) {
-          const name = m.patch.name.trim().slice(0, 60)
-          await mutateFlow($, m.id, f => ({ ...f, name }))
-        }
-        break
-      case 'flow-run': await runFlow($, m.id, typeof m.command === 'string' ? m.command : undefined, typeof m.startId === 'string' ? m.startId : undefined); break
-      case 'card': await patchCard($, m.id, m.patch); break
-      case 'all-flush': await flushAll($, m.id); break
-      case 'flow-stop': await stopFlow($, m.id); break
-      case 'flow-delete': await deleteFlow($, m.id); break
-    }
+    for (const m of unseen(e.data)) await onCanvas($, m)
     return {}
   })
 
@@ -1314,6 +1505,8 @@ export const register: Register = (on, options) => {
     const results = await read($, resultsA)
     const waiting = await read($, waitingA)
     const models = await read($, modelsA)
+    const paste = await read($, pasteA)
+    const chat = await read($, chatA)
     const root = await $.session.root()
     const nodes = flow?.nodes ?? []
     const edges = flow?.edges ?? []
@@ -1341,8 +1534,13 @@ export const register: Register = (on, options) => {
         status: runs[n.id]?.status ?? 'idle',
         preview: runs[n.id]?.preview ?? [],
         prompt: n.prompt,
+        instructions: n.instructions ?? '',
         mode: n.mode,
         isOpen: !!n.sessionId && liveIds.has(n.sessionId),
+        // The selected agent's thinking and full answer, for the side panel; not every card's.
+        ...(sel.kind === 'node' && sel.id === n.id && isAgent(n)
+          ? { thinking: runs[n.id]?.thinking ?? '' }
+          : {}),
         hasSession: !!n.sessionId,
         ...(() => {
           const c = isAgent(n) && flow ? modelFor(flow, n.id) : null
@@ -1361,6 +1559,8 @@ export const register: Register = (on, options) => {
       connectPort,
       picker,
       models,
+      paste,
+      chat,
     }
     // Fit the pane's own body, not the terminal. 4 rows: the hint, the log line and the border.
     const bodyRows = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40

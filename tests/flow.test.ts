@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { applyLive, evaluateEdge, fillTemplate, matchRecipient, parseStreamLine, parseTranscript, peerSection, previewOf, startLive } from '../hooks/flow'
+import { applyLive, composeInstructions, parseChat, evaluateEdge, fillTemplate, instructionRefs, matchRecipient, parseStreamLine, parseTranscript, peerSection, previewOf, resolveRef, startLive, surfaceForTty } from '../hooks/flow'
 import type { FlowEdge } from '../types'
 
 const PANE = {
@@ -79,7 +79,7 @@ describe('interactive sessions', () => {
 
   test('a finished turn shows the prompt and reply', () => {
     const tail = ['{"type":"attachment"}', row('user', 'Draft the intro'), row('assistant', [{ type: 'text', text: 'Here is the intro.' }], 'end_turn')].join('\n')
-    expect(parseTranscript(tail, false)).toEqual({ status: 'done', preview: ['▸ Draft the intro', 'Here is the intro.'], lastOutput: 'Here is the intro.' })
+    expect(parseTranscript(tail, false)).toEqual({ status: 'done', preview: ['▸ Draft the intro', 'Here is the intro.'], lastOutput: 'Here is the intro.', thinking: '' })
   })
 
   test('a turn mid tool call is running, or idle once stale', () => {
@@ -175,6 +175,7 @@ describe('canvas', () => {
       return { x: all[y]!.indexOf(text, minX), y }
     }
     const typeInto = async (text: string, clear = 0) => {
+      await ui.key({ key: 'end', in: 'canvas' }) // a click puts the cursor where it lands
       for (let i = 0; i < clear; i++) await ui.key({ key: 'backspace', in: 'canvas' })
       for (const key of text) await ui.key({ key, in: 'canvas' })
       await ui.key({ key: 'return', in: 'canvas' })
@@ -199,7 +200,7 @@ describe('canvas', () => {
       await click(item.x, item.y)
     }
     await addAgent()
-    await click(60, 27) // empty canvas: clears the selection
+    await click(90, 4) // empty canvas: clears the selection
     await addAgent()
     let [writers] = await savedFlows()
     expect(writers.agents.map((a: any) => a.name)).toEqual(['writers-agent1', 'writers-agent2'])
@@ -219,7 +220,7 @@ describe('canvas', () => {
     expect(writers.links[0]).toMatchObject({ cond: 'always', maxPasses: 4 })
 
     // A second flow: the canvas switches to it, empty; the first is still listed.
-    await click(60, 27)
+    await click(90, 4)
     const another = await at('[ + New flow ]')
     await click(another.x + 2, another.y)
     expect(await savedFlows()).toHaveLength(2)
@@ -232,7 +233,7 @@ describe('canvas', () => {
     expect((await lines()).some(r => r.includes('◆'))).toBe(true)
 
     // Run flow with no Start card adds one and says what to do.
-    await click(60, 27)
+    await click(90, 4)
     const run = await at('▶ Run flow', 98)
     await click(run.x + 2, run.y)
     expect(toasts.join('\n')).toContain('Added a Start card')
@@ -246,7 +247,7 @@ describe('canvas', () => {
     const other = JSON.parse(files[writersFile]!.text)
     other.agents.push({ id: 'ext00001', name: 'From elsewhere', x: 400, y: 400, prompt: '', mode: 'default' })
     files[writersFile] = { text: JSON.stringify(other), mtimeMs: tick++ }
-    await click(60, 27) // Run flow selected the new Start card; back to the flow's settings
+    await click(90, 4) // Run flow selected the new Start card; back to the flow's settings
     const settings = await at('FLOW NAME', 98)
     await click(settings.x, settings.y + 1)
     await typeInto(' v2')
@@ -255,5 +256,121 @@ describe('canvas', () => {
     expect(merged.agents.map((a: any) => a.name)).toContain('From elsewhere')
 
     await ui.unmount()
+  })
+})
+
+describe('agent instructions', () => {
+  const HOME = '/Users/k'
+  const ROOT = '/Users/k/proj'
+  test('a line that is just @path names a file to add', () => {
+    expect(instructionRefs('You review.\n@CLAUDE.md\n  @~/.claude/agents.md  \nEmail me @ noon\n@CLAUDE.md')).toEqual(['CLAUDE.md', '~/.claude/agents.md'])
+  })
+
+  test('files in the project or the agent\'s folder, or .md files in ~/.claude; nothing else', () => {
+    expect(resolveRef('CLAUDE.md', HOME, ROOT, ROOT)).toBe(`${ROOT}/CLAUDE.md`)
+    expect(resolveRef('./docs/../AGENTS.md', HOME, ROOT, ROOT)).toBe(`${ROOT}/AGENTS.md`)
+    expect(resolveRef('brief.md', HOME, ROOT, `${HOME}/other`)).toBe(`${HOME}/other/brief.md`) // the agent's own folder
+    expect(resolveRef('~/.claude/CLAUDE.md', HOME, ROOT, ROOT)).toBe(`${HOME}/.claude/CLAUDE.md`)
+    expect(resolveRef('~/.claude/settings.json', HOME, ROOT, ROOT)).toBeNull() // not markdown
+    expect(resolveRef('~/.ssh/id_rsa', HOME, ROOT, ROOT)).toBeNull()
+    expect(resolveRef('../secrets.md', HOME, ROOT, ROOT)).toBeNull()
+    expect(resolveRef('/etc/passwd', HOME, ROOT, ROOT)).toBeNull()
+  })
+
+  test('the instructions come first, each file in place of its line; a file that can\'t be read says why', () => {
+    const { text, problems } = composeInstructions('Checker', 'You check lists.\n@brief.md\n@~/.ssh/id_rsa', {
+      'brief.md': { path: `${ROOT}/brief.md`, content: 'Only countries.' },
+      '~/.ssh/id_rsa': { error: 'only files in the project, or .md files in ~/.claude' },
+    })
+    expect(text).toContain('[Agent Flows · your instructions as Checker]')
+    expect(text).toContain('You check lists.')
+    expect(text).toContain(`<file path="${ROOT}/brief.md">\nOnly countries.\n</file>`)
+    expect(text).toContain("(@~/.ssh/id_rsa wasn't added: only files in the project, or .md files in ~/.claude)")
+    expect(text.trimEnd().endsWith('[End of instructions. The message follows.]')).toBe(true)
+    expect(problems).toEqual(["@~/.ssh/id_rsa wasn't added: only files in the project, or .md files in ~/.claude"])
+  })
+
+  test('a long file is cut, and says so', () => {
+    const { text } = composeInstructions('A', '@big.md', { 'big.md': { path: '/p/big.md', content: 'x'.repeat(50000) } })
+    expect(text).toContain('(cut at 40000 characters)')
+    expect(text.length).toBeLessThan(41000)
+  })
+})
+
+describe('finding an open chat\'s cmux tab', () => {
+  const TREE = [
+    'window window:1 [current] ◀ active',
+    '├── workspace workspace:24 9F0E… "Agent Flows v0.8" [selected] ◀ active',
+    '│   ├── pane pane:41 1A2B… [focused] ◀ active',
+    '│   │   ├── surface surface:49 0F4AE8C2-1D3B-4C55-9A10-2B3C4D5E6F70 [terminal] "Agent Flows v0.8" [selected] ◀ active ◀ here tty=ttys022',
+    '│   │   ├── surface surface:69 C7899D9A-9003-4163-AD54-9D29B70CAD1F [terminal] "✳ help-design-system-flow-agent1" tty=ttys021',
+    '│   │   └── surface surface:70 D0000000-0000-4000-8000-000000000000 [terminal] "other" tty=ttys0210',
+  ].join('\n')
+  test('the tab whose terminal is the chat\'s', () => {
+    expect(surfaceForTty(TREE, 'ttys021')).toBe('C7899D9A-9003-4163-AD54-9D29B70CAD1F')
+    expect(surfaceForTty(TREE, '/dev/ttys022')).toBe('0F4AE8C2-1D3B-4C55-9A10-2B3C4D5E6F70')
+  })
+  test('none for a terminal no tab shows, or no terminal at all', () => {
+    expect(surfaceForTty(TREE, 'ttys099')).toBeNull()
+    expect(surfaceForTty(TREE, '??')).toBeNull()
+    expect(surfaceForTty(TREE, '')).toBeNull()
+  })
+})
+
+describe('watching an agent work', () => {
+  const j = (o: unknown) => JSON.stringify(o)
+  const delta = (d: unknown) => j({ type: 'stream_event', event: { type: 'content_block_delta', delta: d } })
+
+  test("a background run keeps its thinking as it streams, and starts afresh after it writes", () => {
+    let live = startLive('▸ Find questions')
+    for (const line of [delta({ type: 'thinking_delta', thinking: 'Looking at the ' }), delta({ type: 'thinking_delta', thinking: 'channel' })]) {
+      live = applyLive(live, parseStreamLine(line)!)
+    }
+    expect(live.thinking).toBe('Looking at the channel')
+    expect(previewOf(live).at(-1)).toBe('… thinking')
+    live = applyLive(live, parseStreamLine(delta({ type: 'text_delta', text: 'Found 3.' }))!)
+    live = applyLive(live, parseStreamLine(delta({ type: 'thinking_delta', thinking: 'Now the links' }))!)
+    expect(live.thinking).toBe('Now the links')
+  })
+
+  test("an open chat's transcript gives its latest thinking, and up to eight lines", () => {
+    const rows = [
+      j({ type: 'user', message: { content: 'Count them' } }),
+      j({ type: 'assistant', message: { content: [{ type: 'thinking', thinking: 'First, the channel.' }, { type: 'tool_use', name: 'Grep' }], stop_reason: 'tool_use' } }),
+      j({ type: 'assistant', message: { content: [{ type: 'text', text: Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join('\n') }] } }),
+    ].join('\n')
+    const view = parseTranscript(rows, false)!
+    expect(view.thinking).toBe('First, the channel.')
+    expect(view.preview).toHaveLength(8)
+    expect(view.preview[0]).toBe('▸ Count them')
+    expect(view.preview.at(-1)).toBe('line 10')
+  })
+
+  test('the chat view: typed messages, hand-offs named by sender, replies with tool calls on one line; commands left out', () => {
+    const rows = [
+      j({ type: 'user', message: { content: '<command-name>/mcp</command-name>' } }),
+      j({ type: 'user', message: { content: 'Another Claude session sent a message:\n<cross-session-message from="uds:/x" from-name="Lister">[Agent Flows · run r1 · hand-off 1]\nFrance, Japan</cross-session-message>\nThis came from another Claude session.' } }),
+      j({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read' }] } }),
+      j({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Grep' }] } }),
+      j({ type: 'user', message: { content: [{ type: 'tool_result', content: 'secret file text' }] } }),
+      j({ type: 'assistant', message: { content: [{ type: 'text', text: 'Kept: France' }] } }),
+      j({ type: 'user', message: { content: 'Thanks, now Japan too' } }),
+      j({ type: 'user', isMeta: true, message: { content: 'hidden' } }),
+    ].join('\n')
+    expect(parseChat(rows)).toEqual([
+      { who: 'peer', from: 'Lister', text: '[Agent Flows · run r1 · hand-off 1]\nFrance, Japan' },
+      { who: 'agent', text: '⚙ Read · ⚙ Grep' },
+      { who: 'agent', text: 'Kept: France' },
+      { who: 'you', text: 'Thanks, now Japan too' },
+    ])
+  })
+
+  test('a very long chat keeps its newest messages, a huge one cut', () => {
+    const rows = Array.from({ length: 100 }, (_, i) => j({ type: 'user', message: { content: `message ${i}` } }))
+    rows.push(j({ type: 'assistant', message: { content: [{ type: 'text', text: 'x'.repeat(50000) }] } }))
+    const chat = parseChat(rows.join('\n'))
+    expect(chat.length).toBeLessThanOrEqual(60)
+    expect(chat.at(-1)!.text).toContain('(cut here; the rest is in the chat)')
+    expect(chat.at(-2)!.text).toBe('message 99')
   })
 })

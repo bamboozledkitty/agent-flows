@@ -37,8 +37,10 @@ export type FlowNode = {
   /** Absent: an agent. */
   kind?: CardKind
   card?: CardConfig
-  /** Agent: what a manual Run sends it. Start: the command a run begins with. */
+  /** Agent: the test message ▶ Run sends it alone. Start: the command a run begins with. */
   prompt: string
+  /** Agent: sent ahead of every message it gets; a line that is just `@path` adds that file. */
+  instructions?: string
   mode: PermMode
   /** The real Claude session behind the node; set on first run or open. */
   sessionId?: string
@@ -92,7 +94,15 @@ export type NodeRun = {
   /** Last few lines of activity, newest last. */
   preview: string[]
   lastOutput: string
+  /** The tail of the turn's latest thinking, where Claude shows it. */
+  thinking?: string
 }
+
+/** One message of a chat, as the read-only chat view shows it. */
+export type ChatLine = { who: 'you' | 'agent' | 'peer'; from?: string; text: string }
+
+/** The read-only chat view: an agent's conversation, newest last. */
+export type ChatView = { id: string; name: string; lines: ChatLine[]; status: RunStatus; note?: string }
 
 /** What the canvas surface module is handed. */
 export type CanvasNode = {
@@ -117,12 +127,15 @@ export type CanvasNode = {
   status: RunStatus
   preview: string[]
   prompt: string
+  instructions: string
   mode: PermMode
   /** Running right now in some terminal (the session registry lists it). */
   isOpen: boolean
   hasSession: boolean
   /** Agent: the model its Model card sets, e.g. `sonnet-5-5 · high`; absent with none linked. */
   model?: string
+  /** The selected agent only: its latest thinking, for its activity drawer. */
+  thinking?: string
 }
 
 /** A Claude session running on this machine that the canvas could adopt. */
@@ -173,6 +186,10 @@ export type CanvasProps = {
   picker: PickerView | null
   /** The models a Model card offers; null until first loaded. */
   models: ModelList | null
+  /** The clipboard as last read for a Cmd+V; `seq` counts reads. */
+  paste: { seq: number; text: string } | null
+  /** The read-only chat view, while one is open. */
+  chat: ChatView | null
 }
 
 /** The Model card's choices; `note` names entries of the "Extra models" option that were left out. */
@@ -182,6 +199,9 @@ export type ModelList = { ids: string[]; note?: string; loading?: boolean }
 export type CardPatch = Partial<Omit<CardConfig, 'effort'>> & { prompt?: string; effort?: Effort | '' }
 
 /** What the canvas posts back to the hooks module. */
+/** What the canvas posts: its latest messages, numbered, so one post replacing another loses none. */
+export type CanvasBatch = { t: 'batch'; sender: string; items: { seq: number; m: CanvasMessage }[] }
+
 export type CanvasMessage =
   | { t: 'select'; sel: Selection }
   | { t: 'move'; id: string; x: number; y: number }
@@ -192,9 +212,10 @@ export type CanvasMessage =
   | { t: 'cancel' }
   | { t: 'new'; x: number; y: number; kind?: CardKind }
   | { t: 'delete' }
-  | { t: 'run'; id: string }
+  /** ▶ Run one agent: `prompt`, the test message, kept for next time. */
+  | { t: 'run'; id: string; prompt?: string }
   | { t: 'edge'; id: string; patch: { cond?: Condition; value?: string; maxPasses?: number } }
-  | { t: 'node'; id: string; patch: { name?: string; prompt?: string; mode?: PermMode } }
+  | { t: 'node'; id: string; patch: { name?: string; prompt?: string; instructions?: string; mode?: PermMode } }
   | { t: 'stop'; id: string }
   | { t: 'fresh'; id: string }
   | { t: 'picker'; open: boolean }
@@ -210,6 +231,10 @@ export type CanvasMessage =
   | { t: 'flow-stop'; id: string }
   | { t: 'flow-delete'; id: string }
   | { t: 'models'; refresh?: boolean }
+  /** Cmd+V in a text box: read the clipboard into `paste`. */
+  | { t: 'paste' }
+  /** Open an agent's chat to read on the canvas, or close it (`id: null`). */
+  | { t: 'chat'; id: string | null }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -227,6 +252,8 @@ declare module 'claude-code' {
       picker: PickerView | null
       liveIds: string[]
       models: ModelList | null
+      paste: { seq: number; text: string } | null
+      chat: ChatView | null
     }
   }
 }

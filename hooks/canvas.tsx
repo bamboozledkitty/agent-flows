@@ -2,6 +2,7 @@ import type { ClientModule, ClientPointerEvent, ClientKeyEvent } from 'claude-co
 
 import type {
   AvailableSession,
+  CanvasBatch,
   CanvasEdge,
   CanvasMessage,
   CanvasNode,
@@ -17,6 +18,23 @@ import type {
 export const NODE_W = 28
 export const NODE_H = 6
 const DOUBLE_CLICK_MS = 450
+
+/**
+ * A post in the same frame as another replaces it, so a click that saves a box and
+ * runs the flow would lose the save. Each post carries the messages of the last
+ * two seconds, numbered; the hooks module takes each number once.
+ */
+const SENDER = Math.random().toString(36).slice(2)
+const RESEND_MS = 2000
+/** Whether the latest drawing had a card running: the blink clock stops when none does. */
+let isRunningNow = false
+let lastSeq = 0
+let recent: { seq: number; at: number; m: CanvasMessage }[] = []
+function postMessage(post: (b: CanvasBatch) => void, m: CanvasMessage) {
+  const at = Date.now()
+  recent = [...recent.filter(r => at - r.at < RESEND_MS), { seq: ++lastSeq, at, m }].slice(-30)
+  post({ t: 'batch', sender: SENDER, items: recent.map(({ seq, m }) => ({ seq, m })) })
+}
 // Layout: the Flows list on the left, details on the right, the open flow's canvas between.
 const LEFT_W = 26
 const RIGHT_W = 38
@@ -37,7 +55,7 @@ type Drag =
  * A text field being typed into on the canvas, until Enter saves it. `card`: one of
  * a logic card's settings, named by `field`. `run`: the command Run flow sends.
  */
-type Edit = { kind: 'name' | 'prompt' | 'flow-name' | 'card' | 'run'; id: string; text: string; field?: string }
+type Edit = { kind: 'name' | 'prompt' | 'instructions' | 'flow-name' | 'card' | 'run' | 'test'; id: string; text: string; field?: string; pos?: number }
 
 type Local = {
   pan: { x: number; y: number }
@@ -56,9 +74,21 @@ type Local = {
   zoom: number
   /** The running-chat browser: its search, the highlighted row and first row shown, and the folder box while typed in. */
   browse: Browse | null
+  /** The last paste taken in. */
+  pasteSeq?: number
+  /** The chat view: its first row shown while scrolled back, for the chat it was scrolled in; absent, it follows the newest. */
+  chatFirst?: number
+  chatFor?: string
+  /** The details panel's first row shown, for the card or link it was scrolled on. */
+  detailTop?: number
+  detailFor?: string | null
+  /** Which half of a running card's blink is drawn, and whether its clock has started. */
+  blink?: boolean
+  /** The canvas code whose blink clock runs: a reloaded one starts its own. */
+  ticking?: string
 }
 
-type Browse = { dir: string; q: string; hi: number; top: number; folder: string | null }
+type Browse = { dir: string; q: string; hi: number; top: number; folder: string | null; qPos?: number; fPos?: number }
 
 /** The orange that marks folders with running chats in them or below. */
 const CHAT_ORANGE = '#FF8700'
@@ -84,6 +114,73 @@ const typedText = (k: ClientKeyEvent) => {
   return NAMED_KEYS.has(k.key) || /^f\d{1,2}$/.test(k.key) ? null : k.key.replace(/[\r\n\t]+/g, ' ')
 }
 
+/** A text box's text and its cursor, 0 to the text's length. */
+type Caret = { text: string; pos: number }
+type Line = { start: number; text: string }
+const CARET = '▏'
+
+/**
+ * Lays text out in lines of at most `width`, breaking after a space and keeping
+ * every character, so a cursor position and a clicked cell map onto each other.
+ */
+function layoutText(text: string, width: number): Line[] {
+  const w = Math.max(1, width)
+  const lines: Line[] = []
+  let i = 0
+  while (text.length - i > w) {
+    const cut = text.lastIndexOf(' ', i + w - 1)
+    const end = cut >= i ? cut + 1 : i + w
+    lines.push({ start: i, text: text.slice(i, end) })
+    i = end
+  }
+  lines.push({ start: i, text: text.slice(i) })
+  return lines
+}
+const lineAt = (lines: Line[], pos: number) => {
+  let i = 0
+  while (i + 1 < lines.length && lines[i + 1]!.start <= pos) i++
+  return i
+}
+/** Where a click `dx` cells into a shown line puts the cursor; `caretCol`: where the cursor is drawn on it, if it is. */
+const posIn = (line: Line, dx: number, caretCol: number | null) =>
+  line.start + Math.max(0, Math.min(caretCol !== null && dx > caretCol ? dx - 1 : dx, line.text.length))
+
+/**
+ * One key in a text box: the text and cursor after it, or null for a key the box
+ * doesn't take. `lines`: the box's layout, for up, down, Home and End by line.
+ */
+function keyInto(c: Caret, k: ClientKeyEvent, lines?: Line[]): Caret | null {
+  const key = k.key
+  const at = (pos: number): Caret => ({ text: c.text, pos: Math.max(0, Math.min(c.text.length, pos)) })
+  const i = lines ? lineAt(lines, c.pos) : 0
+  const line = lines?.[i]
+  if (key === 'left') return at(c.pos - 1)
+  if (key === 'right') return at(c.pos + 1)
+  if (key === 'home' || (k.ctrl && key === 'a')) return at(line ? line.start : 0)
+  if (key === 'end' || (k.ctrl && key === 'e')) {
+    if (!line || !lines || i === lines.length - 1) return at(line ? line.start + line.text.length : c.text.length)
+    return at(line.start + line.text.length - 1) // before the space the line breaks at
+  }
+  if (key === 'up' || key === 'down') {
+    if (!lines || !line) return null
+    const to = lines[i + (key === 'up' ? -1 : 1)]
+    if (!to) return at(key === 'up' ? 0 : c.text.length)
+    const last = to === lines[lines.length - 1]
+    return at(to.start + Math.min(c.pos - line.start, to.text.length - (last ? 0 : 1)))
+  }
+  if (key === 'backspace' || key === 'delete') {
+    if (c.pos === 0) return c
+    return { text: c.text.slice(0, c.pos - 1) + c.text.slice(c.pos), pos: c.pos - 1 }
+  }
+  const typed = typedText(k)
+  if (typed === null) return null
+  return { text: c.text.slice(0, c.pos) + typed + c.text.slice(c.pos), pos: c.pos + typed.length }
+}
+/** A box's text and cursor; with no cursor yet, at the end. */
+const caretOf = (e: { text: string; pos?: number }): Caret => ({ text: e.text, pos: Math.min(e.pos ?? e.text.length, e.text.length) })
+const insertAt = (c: Caret, text: string): Caret => ({ text: c.text.slice(0, c.pos) + text + c.text.slice(c.pos), pos: c.pos + text.length })
+const isPasteKey = (k: ClientKeyEvent) => (k.meta || k.ctrl) && k.key.toLowerCase() === 'v'
+
 type Cell = { ch: string; color?: string; bold?: boolean; dim?: boolean }
 
 // Line joins: each cell keeps which sides a line touches, then picks the box glyph.
@@ -98,7 +195,7 @@ const STATUS_COLOR: Record<RunStatus, string | undefined> = {
   idle: undefined, queued: 'blue', running: 'yellow', done: 'green', error: 'red', stopped: 'gray',
 }
 const STATUS_ICON: Record<RunStatus, string> = {
-  idle: '○', queued: '◔', running: '◐', done: '●', error: '✕', stopped: '■',
+  idle: '○', queued: '◔', running: '●', done: '✓', error: '✕', stopped: '■',
 }
 const statusWord = (n: { status: RunStatus; hasSession: boolean }) =>
   n.status === 'idle'
@@ -137,12 +234,18 @@ const KINDS: { kind: CardKind; icon: string; label: string; blurb: string; color
 const metaOf = (k: CardKind) => KINDS.find(x => x.kind === k)!
 const portLabel = (port: string) =>
   ({ out: 'Out', yes: 'Yes', no: 'No', other: 'Other', done: 'Done', again: 'Again' } as Record<string, string>)[port] ?? port
-/** The row, from a card's top, a link from `port` leaves at; keep in step with portRow in cards.ts. */
-const portRow = (n: CanvasNode, port: string) => (n.ports.length <= 1 ? 2 : 3 + Math.max(0, n.ports.indexOf(port)))
+/**
+ * A card in bands: title, then the sockets row (input left, output right), then its
+ * body, and for an agent its status and button. These rows, from a card's top, are
+ * where the dots sit; keep in step with portRow in cards.ts.
+ */
+const SOCKET_ROW = { agent: 4, other: 3 }
 /** The row, from a card's top, of its input dot on the left edge. */
-const INPUT_ROW = 2
-/** The row of an agent's second input, under the first: its model, from a Model card. */
-const MODEL_ROW = 3
+const inputRow = (n: Pick<CanvasNode, 'kind'>) => (n.kind === 'agent' ? SOCKET_ROW.agent : SOCKET_ROW.other)
+/** An agent's second input, under the first: its model, from a Model card. */
+const MODEL_ROW = SOCKET_ROW.agent + 1
+/** The row a link from `port` leaves at: the sockets row for one output, else one row each under the body. */
+const portRow = (n: CanvasNode, port: string) => (n.ports.length <= 1 ? inputRow(n) : 7 + Math.max(0, n.ports.indexOf(port)))
 
 /** Zoom steps, out to in. Text cells can't grow, so 100% is the closest view. */
 const ZOOMS = [0.5, 0.75, 1]
@@ -150,11 +253,11 @@ const ZOOMS = [0.5, 0.75, 1]
  * Card size and dot rows at a zoom. Below 100% cards are compact: a name row and
  * a status (or summary) row, or one row per named output; dots sit one row higher.
  */
-type Geo = { z: number; w: number; isCompact: boolean; inRow: number; modelRow: number }
-const geoAt = (z: number): Geo =>
-  z >= 1
-    ? { z: 1, w: NODE_W, isCompact: false, inRow: INPUT_ROW, modelRow: MODEL_ROW }
-    : { z, w: Math.round(NODE_W * z), isCompact: true, inRow: 1, modelRow: 2 }
+type Geo = { z: number; w: number; isCompact: boolean }
+const geoAt = (z: number): Geo => (z >= 1 ? { z: 1, w: NODE_W, isCompact: false } : { z, w: Math.round(NODE_W * z), isCompact: true })
+/** A card's input dot row, and an agent's model dot row, at a zoom. */
+const inRowAt = (n: Pick<CanvasNode, 'kind'>, g: Geo) => (g.isCompact ? 1 : inputRow(n))
+const modelRowAt = (g: Geo) => (g.isCompact ? 2 : MODEL_ROW)
 const portRowAt = (n: CanvasNode, port: string, g: Geo) =>
   !g.isCompact ? portRow(n, port) : n.ports.length <= 1 ? 1 : 2 + Math.max(0, n.ports.indexOf(port))
 const heightAt = (n: CanvasNode, g: Geo) => (!g.isCompact ? n.ht : n.ports.length > 1 ? n.ports.length + 3 : 4)
@@ -188,6 +291,53 @@ const clipMid = (text: string, n: number) => {
   return text.slice(0, n - 1 - tail) + '…' + text.slice(text.length - tail)
 }
 const oneLine =(s: string) => s.replace(/\s+/g, ' ').trim()
+
+/** Text in lines of `width`, its own line breaks kept, `max` lines at most. */
+function wrapText(text: string, width: number, max: number): string[] {
+  const out = text.split('\n').flatMap(l => (l.trim() ? wrap(l, width, 1000) : ['']))
+  while (out.length && !out[0]) out.shift()
+  return out.length > max ? [...out.slice(0, max - 1), '… (more in the chat view)'] : out
+}
+
+/** Markdown's marks taken out, for text drawn in cells: **bold**, `code`, [links](url), # headings. */
+const plain = (s: string) =>
+  s.replace(/\*\*|__|`/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').replace(/^#{1,6}\s+/gm, '')
+
+/**
+ * An agent's newest activity in `max` lines of `width`: its reply lines (the prompt
+ * that started the turn left out when there are any), wrapped, the latest kept.
+ */
+function activityTail(preview: string[], width: number, max: number): string[] {
+  const replies = preview.filter(p => !p.startsWith('▸'))
+  const text = (replies.length ? replies : preview).map(plain).join('\n')
+  const lines = text.split('\n').flatMap(l => (l.trim() ? wrap(l, width, 1000) : []))
+  if (lines.length <= max) return lines
+  const kept = lines.slice(-max)
+  kept[0] = clip('… ' + kept[0], width)
+  return kept
+}
+
+/** An agent card's foot: what clicking it opens, or how to start one with no chat yet. */
+const agentCta = (n: CanvasNode): { text: string; style: { color?: string; bold?: boolean; dim?: boolean }; opens: boolean } =>
+  n.status === 'running' ? { text: 'Watch live ›', style: { color: 'yellow', bold: true }, opens: true }
+    : n.hasSession ? { text: 'See response ›', style: { color: 'cyan', bold: true }, opens: true }
+      : { text: 'Double-click to start', style: { dim: true }, opens: false }
+
+/** The selected agent's activity drawer, under its card: width, and rows at most. */
+const DRAWER_W = 60
+const DRAWER_ROWS = 14
+
+/** A card's name in two lines at most, broken after a hyphen or at a space where one is near. */
+function wrapName(name: string, width: number): string[] {
+  if (name.length <= width) return [name]
+  const dash = name.lastIndexOf('-', width - 1)
+  const space = name.lastIndexOf(' ', width)
+  const at = dash > width / 3 ? dash + 1 : space > width / 3 ? space : width
+  return [name.slice(0, at).trimEnd(), clipMid(name.slice(at).trimStart(), width)]
+}
+
+/** A running card's dot: bright, then dim, every BLINK_MS. */
+const BLINK_MS = 600
 
 /** Word-wraps to `width`, at most `max` lines, the last one ending in … when cut. */
 function wrap(text: string, width: number, max: number): string[] {
@@ -232,15 +382,19 @@ const ago = (ms: number) => {
 }
 
 // A panel row: pieces of text, each optionally clickable; a whole-row click is `act`.
-type Seg = { text: string; act?: () => void; color?: string; bold?: boolean; dim?: boolean }
-type Row = { segs: Seg[]; act?: () => void; color?: string; bold?: boolean; dim?: boolean; right?: Seg }
+/** A clickable piece's action gets the clicked column, from the piece's first cell. */
+type Act = (dx: number) => void
+type Seg = { text: string; act?: Act; color?: string; bold?: boolean; dim?: boolean }
+/** A button in a grid: its label, what it does, its colour. */
+type GridButton = [string, () => void, string]
+type Row = { segs: Seg[]; act?: Act; color?: string; bold?: boolean; dim?: boolean; right?: Seg }
 const row = (text: string, opts: Omit<Row, 'segs'> = {}): Row => ({ segs: [{ text }], ...opts })
 const heading = (text: string): Row => row(text, { dim: true, bold: true })
 const blank = (): Row => row('')
 const button = (label: string, act: () => void, color = 'cyan'): Seg => ({ text: `[ ${label} ]`, act, color, bold: true })
 const gap = (n = 2): Seg => ({ text: ' '.repeat(n) })
 
-type Hit = { x1: number; x2: number; y: number; act: () => void }
+type Hit = { x1: number; x2: number; y: number; act: Act }
 type Panel = { x: number; y: number; w: number; ht: number; hits: Hit[] }
 
 type LaidEdge = { id: string; points: [number, number][]; label: string; lx: number; ly: number; arrow: [number, number, string] }
@@ -292,7 +446,7 @@ export function layoutEdges(nodes: CanvasNode[], edges: CanvasProps['edges'], g:
     const sx = a.x + g.w
     const sy = a.y + portRowAt(a, e.port, g)
     const tx = b.x - 1
-    const ty = b.y + (e.isModel ? g.modelRow : g.inRow)
+    const ty = b.y + (e.isModel ? modelRowAt(g) : inRowAt(b, g))
     if (isRight) {
       const lane = rightIndex.get(e.id) ?? 0
       const mx = Math.min(tx - 2, sx + 3 + lane * 2)
@@ -340,14 +494,31 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
     notice: null,
     zoom: 1,
     browse: null,
+    // A paste from before this canvas opened isn't for it.
+    pasteSeq: props.paste?.seq,
   }
   const zoom = local.zoom ?? 1
   const g = geoAt(zoom)
   const W = g.w
-  const IN_ROW = g.inRow
-  const M_ROW = g.modelRow
+  const M_ROW = modelRowAt(g)
   const rowAt = (n: CanvasNode, port: string) => portRowAt(n, port, g)
-  const send = (m: CanvasMessage) => surface.post(m)
+  const send = (m: CanvasMessage) => postMessage(b => surface.post(b), m)
+
+  // Running cards blink: one clock for the instance, redrawing only while one runs.
+  const anyRunning = props.nodes.some(n => n.status === 'running')
+  if (local.ticking !== SENDER) {
+    surface.every(BLINK_MS, () => {
+      const st = surface.state as Local | undefined
+      if (st && (st.blink || isRunningNow)) surface.setState({ ...st, blink: !st.blink })
+    })
+    // Kept in the state, so a later redraw doesn't start a second clock.
+    local.ticking = SENDER
+    surface.setState({ ...local })
+  }
+  isRunningNow = anyRunning
+  /** A running card's status dot, as this half of the blink draws it. */
+  const pulse = (n: { status: RunStatus }) =>
+    n.status === 'running' ? { color: 'yellow', bold: !local.blink, dim: !!local.blink } : { color: STATUS_COLOR[n.status], dim: !STATUS_COLOR[n.status] }
 
   // Drop overrides the hooks module has caught up with.
   const held = { ...local.held }
@@ -368,10 +539,37 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
 
   const selId = props.selected.kind === 'none' ? null : props.selected.id
   const selNode = props.selected.kind === 'node' ? nodes.find(n => n.id === selId) : undefined
+  /** The details panel scrolls back to its top for another card or link. */
+  const detailTop = local.detailFor === selId ? local.detailTop ?? 0 : 0
+  /** Where the details panel was drawn scrolled to, and how far it goes: PgUp / PgDn stay within it. */
+  let detailRange: { first: number; last: number } | null = null
+  const pageDetails = (dir: 1 | -1) => {
+    if (!detailRange) return
+    const to = Math.max(0, Math.min(detailRange.last, detailRange.first + dir * Math.max(4, rows - 8)))
+    set({ detailTop: to, detailFor: selId })
+  }
   const selEdge: CanvasEdge | undefined = props.selected.kind === 'edge' ? props.edges.find(x => x.id === selId) : undefined
   const nameOf = (id: string) => nodes.find(n => n.id === id)?.name ?? '?'
   const openFlow = props.flows.find(f => f.id === props.openFlowId)
   const edit: Edit | null = local.edit
+  /** Ctrl+V: the hooks module reads the Mac clipboard and hands it back as `props.paste`. */
+  const askPaste = () => send({ t: 'paste' })
+  // A paste has arrived (Ctrl+V's, or Cmd+V's caught on its way to the prompt box): into the box being typed in, at its cursor.
+  if (props.paste && props.paste.seq !== local.pasteSeq) {
+    const text = props.paste.text
+    const b = local.browse
+    if (props.picker && b && b.folder !== null) {
+      const c = insertAt(caretOf({ text: b.folder, pos: b.fPos }), text)
+      set({ browse: { ...b, folder: c.text, fPos: c.pos } })
+    } else if (props.picker && b) {
+      const c = insertAt(caretOf({ text: b.q, pos: b.qPos }), text)
+      set({ browse: { ...b, q: c.text, qPos: c.pos, hi: 0, top: 0 } })
+    } else if (local.edit) {
+      const c = insertAt(caretOf(local.edit), text)
+      set({ edit: { ...local.edit, text: c.text, pos: c.pos } })
+    } else if (text) set({ notice: 'Click a text box to paste into it.' })
+    set({ pasteSeq: props.paste.seq })
+  }
 
   /** World point at the middle of the open canvas area, between the side panels. */
   const midX = Math.floor((leftW + cols - rightW) / 2)
@@ -398,14 +596,29 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
   function runFlowNow() {
     if (!props.openFlowId) return
     const starts = nodes.filter(n => n.kind === 'start')
-    if (starts.length === 1) set({ edit: { kind: 'run', id: starts[0]!.id, text: starts[0]!.prompt }, menu: false })
+    const start = starts[0]
+    // A command being typed in the Start card's box, not yet saved, is the one to run.
+    const typed = edit && edit.id === start?.id && (edit.kind === 'prompt' || edit.field === 'prompt') ? edit.text : undefined
+    if (start && starts.length === 1) set({ edit: { kind: 'run', id: start.id, text: typed ?? start.prompt }, menu: false })
     else send({ t: 'flow-run', id: props.openFlowId })
   }
   function submitRun() {
-    if (!edit || edit.kind !== 'run' || !props.openFlowId) return
-    send({ t: 'flow-run', id: props.openFlowId, command: edit.text, startId: edit.id })
+    if (edit?.kind === 'test') send({ t: 'run', id: edit.id, prompt: edit.text })
+    else if (edit?.kind === 'run' && props.openFlowId) send({ t: 'flow-run', id: props.openFlowId, command: edit.text, startId: edit.id })
+    else return
     set({ edit: null })
   }
+  /** A text box's typing, kept: on Enter, or a click anywhere else. Run and Test boxes send only on ▶ Run. */
+  function saveEdit(e: Edit) {
+    if (e.kind === 'run' || e.kind === 'test') return
+    if (e.kind === 'flow-name') send({ t: 'flow-patch', id: e.id, patch: { name: e.text } })
+    else if (e.kind === 'card' && e.field) {
+      const value = e.field === 'branches' ? e.text.split(',').map(b => b.trim()).filter(Boolean) : e.text
+      send({ t: 'card', id: e.id, patch: { [e.field]: value } })
+    } else if (e.kind !== 'card') send({ t: 'node', id: e.id, patch: { [e.kind]: e.text } })
+  }
+  /** ▶ Run on one agent: a test message to edit first, the last one filled in. */
+  const testAgent = (n: CanvasNode) => set({ edit: { kind: 'test', id: n.id, text: n.prompt }, menu: false })
 
   const cardAt = (x: number, y: number) => [...nodes].reverse().find(n => x >= n.x && x < n.x + W && y >= n.y && y < n.y + n.ht)
   /** A card's output dot under a point: a named output's label, or a single output's dot on the right edge. */
@@ -414,7 +627,7 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
       ? x >= n.x + W - Math.min(12, W - 2) ? n.ports.find(p => n.y + rowAt(n, p) === y) : undefined
       : n.ports.length === 1 && x >= n.x + W - 2 && y === n.y + rowAt(n, n.ports[0]!) ? n.ports[0] : undefined
   /** A card's input dot under a point, on the left edge. */
-  const isInputAt = (n: CanvasNode, x: number, y: number) => canLinkTo(n) && x <= n.x + 1 && y === n.y + IN_ROW
+  const isInputAt = (n: CanvasNode, x: number, y: number) => canLinkTo(n) && x <= n.x + 1 && y === n.y + inRowAt(n, g)
   /** An agent's model dot under a point, on the left edge under its input. */
   const isModelInputAt = (n: CanvasNode, x: number, y: number) => n.kind === 'agent' && x <= n.x + 1 && y === n.y + M_ROW
   /**
@@ -457,6 +670,30 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
   const put = (wx: number, wy: number, cell: Cell) => putS(wx - local.pan.x, wy - local.pan.y, cell)
   const text = (wx: number, wy: number, s: string, style: Omit<Cell, 'ch'> = {}) =>
     [...s].forEach((ch, i) => put(wx + i, wy, { ch, ...style }))
+  /** A band's edge across a card: ├────┤ in its border colour (the left side dashed, for a Note). */
+  const divider = (n: CanvasNode, dy: number, color: string, vt: string) => {
+    const W2 = geoAt(local.zoom ?? 1).w
+    put(n.x, n.y + dy, { ch: vt === '┆' ? '┆' : vt === '┃' ? '┣' : '├', color })
+    for (let dx = 1; dx < W2 - 1; dx++) put(n.x + dx, n.y + dy, { ch: vt === '┃' ? '━' : '─', color })
+    put(n.x + W2 - 1, n.y + dy, { ch: vt === '┆' ? '┆' : vt === '┃' ? '┫' : '┤', color })
+  }
+  /**
+   * The sockets row's words beside its dots: `in` at the left, faintly followed by
+   * the card it hears from (and how many more), and `out` at the right.
+   */
+  const socketLabels = (n: CanvasNode, dy: number, hasIn: boolean, hasOut: boolean) => {
+    const W2 = geoAt(local.zoom ?? 1).w
+    if (hasIn) {
+      text(n.x + 2, n.y + dy, 'in', { dim: true })
+      const from = [...new Set(props.edges.filter(e => e.to === n.id && !e.isModel).map(e => e.fromName))]
+      if (from.length) {
+        const more = from.length > 1 ? ` +${from.length - 1}` : ''
+        const room = W2 - 4 - 3 - (hasOut ? 5 : 0) - more.length
+        text(n.x + 4, n.y + dy, ` ← ${clipMid(from[0]!, room - 1)}${more}`, { color: 'gray', dim: true })
+      }
+    }
+    if (hasOut) text(n.x + W2 - 5, n.y + dy, 'out', { dim: true })
+  }
   const mark = (wx: number, wy: number, bits: number, color: string) => {
     const x = wx - local.pan.x
     const y = wy - local.pan.y
@@ -470,7 +707,7 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
   /** Draws a bordered panel in screen cells and records what each clickable piece does. */
   const drawPanel = (
     x: number, y: number, w: number, title: string, body: Row[],
-    opts: { ht?: number; color?: string; footer?: Row[] } = {},
+    opts: { ht?: number; color?: string; footer?: Row[]; scroll?: { top: number; to: (top: number) => void } } = {},
   ) => {
     const color = opts.color ?? 'gray'
     const ht = opts.ht ?? body.length + (opts.footer?.length ?? 0) + 2
@@ -478,8 +715,27 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
     const t = clip(` ${title} `, w - 4)
     const top = '╭─' + t + '─'.repeat(Math.max(0, w - 3 - t.length)) + '╮'
     ;[...top].forEach((ch, i) => putS(x + i, y, { ch, color: i > 1 && i < t.length + 2 ? undefined : color, bold: i > 1 && i < t.length + 2 }))
-    const footer = opts.footer ?? []
-    const lines: (Row | undefined)[] = [...body.slice(0, ht - 2 - footer.length)]
+    let footer = opts.footer ?? []
+    let shown = body
+    let scrolled: { first: number; last: number } | null = null
+    // Taller than the panel: a page of it, and ▲ ▼ above the footer to move through it.
+    const room = ht - 2 - footer.length
+    if (opts.scroll && body.length > room) {
+      const page = room - 1
+      const first = Math.max(0, Math.min(opts.scroll.top, body.length - page))
+      const to = opts.scroll.to
+      shown = body.slice(first, first + page)
+      scrolled = { first, last: body.length - page }
+      footer = [{
+        segs: [
+          { text: '▲', bold: true, color: first > 0 ? 'cyan' : undefined, dim: first === 0, act: () => to(Math.max(0, first - page + 2)) },
+          gap(2),
+          { text: '▼', bold: true, color: first + page < body.length ? 'cyan' : undefined, dim: first + page >= body.length, act: () => to(Math.min(body.length - page, first + page - 2)) },
+          { text: `  ${first + 1}–${Math.min(body.length, first + page)} of ${body.length} · PgUp PgDn`, dim: true },
+        ],
+      }, ...footer]
+    }
+    const lines: (Row | undefined)[] = [...shown.slice(0, ht - 2 - footer.length)]
     while (lines.length < ht - 2 - footer.length) lines.push(undefined)
     lines.push(...footer)
     lines.forEach((r, i) => {
@@ -506,6 +762,7 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
     const bottom = '╰' + '─'.repeat(w - 2) + '╯'
     ;[...bottom].forEach((ch, i) => putS(x + i, y + ht - 1, { ch, color }))
     panels.push({ x, y, w, ht, hits })
+    return scrolled
   }
 
   // Lines first, then cards, then labels on the lines.
@@ -565,9 +822,11 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
     if (g.isCompact) {
       // Zoomed out: the name, then the status, a summary, or the named outputs.
       if (isAgent) {
-        text(n.x + 2, n.y + 1, clipMid(n.name, inner - (n.isOpen ? 2 : 0)), { bold: true })
-        if (n.isOpen) text(n.x + W - 3, n.y + 1, '⧉', { color: 'green' })
-        text(n.x + 2, n.y + 2, clip(`${STATUS_ICON[n.status]} ${statusWord(n)}`, inner), { color: STATUS_COLOR[n.status], dim: !STATUS_COLOR[n.status] })
+        const mark = n.status === 'running' ? 2 : n.isOpen ? 2 : 0
+        text(n.x + 2, n.y + 1, clipMid(n.name, inner - mark), { bold: true })
+        if (n.status === 'running') text(n.x + W - 3, n.y + 1, '●', pulse(n))
+        else if (n.isOpen) text(n.x + W - 3, n.y + 1, '⧉', { color: 'green' })
+        text(n.x + 2, n.y + 2, clip(`${STATUS_ICON[n.status]} ${statusWord(n)}`, inner), pulse(n))
       } else {
         text(n.x + 2, n.y + 1, clip(`${m.icon} ${clipMid(n.name, inner - 2)}`, inner), { bold: true })
         if (n.ports.length > 1) {
@@ -579,37 +838,45 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
         } else text(n.x + 2, n.y + 2, clip(n.kind === 'note' ? n.card.text || 'Write a note' : n.summary, inner), { dim: true })
       }
     } else if (isAgent) {
-      // Name on the first row, open-in-a-tab mark at its right; status under it.
-      text(n.x + 2, n.y + 1, clipMid(n.name, inner - 2), { bold: true })
-      if (n.isOpen) text(n.x + W - 3, n.y + 1, '⧉', { color: 'green' })
-      text(n.x + 2, n.y + 2, `${STATUS_ICON[n.status]} ${statusWord(n)}`, { color: STATUS_COLOR[n.status], dim: !STATUS_COLOR[n.status] })
-      // Its model, beside the model dot; then last activity, else the Run prompt, else what to do next.
-      if (n.model) text(n.x + 2, n.y + M_ROW, clip(`◈ ${n.model}`, inner), { color: 'blue' })
-      const room = n.model ? 1 : 2
-      const body = n.preview.length
-        ? n.preview.slice(-room).map(p => clip(oneLine(p), inner))
-        : n.prompt
-          ? wrap(n.prompt, inner, room)
-          : [n.hasSession ? 'Double-click to chat' : 'Double-click to start']
-      body.forEach((line, i) => text(n.x + 2, n.y + 5 - room + i, line, { dim: true }))
+      // Title: the name (two lines when long), a blinking dot at its right while it
+      // runs (else the open-in-a-tab mark).
+      wrapName(n.name, inner - 2).forEach((l, i) => text(n.x + 2, n.y + 1 + i, l, { bold: true }))
+      if (n.status === 'running') text(n.x + W - 3, n.y + 1, '●', pulse(n))
+      else if (n.isOpen) text(n.x + W - 3, n.y + 1, '⧉', { color: 'green' })
+      divider(n, 3, border, vt)
+      // Sockets: messages in and out, then the model it runs on.
+      socketLabels(n, SOCKET_ROW.agent, true, true)
+      text(n.x + 2, n.y + MODEL_ROW, 'model', { dim: true })
+      text(n.x + 9, n.y + MODEL_ROW, clip(n.model ?? 'your default', inner - 7), n.model ? { color: 'blue' } : { dim: true })
+      divider(n, 6, border, vt)
+      // Status, then the way to its work: the chat view, live while it runs.
+      text(n.x + 2, n.y + 7, `${STATUS_ICON[n.status]} ${statusWord(n)}`, pulse(n))
+      const cta = agentCta(n)
+      text(n.x + 2, n.y + 8, clip(cta.text, inner), cta.style)
     } else {
+      // Title, then the sockets row, then the body; named outputs get their own band.
       text(n.x + 2, n.y + 1, `${m.icon} `, { color: m.color, bold: true })
       text(n.x + 4, n.y + 1, clipMid(n.name, inner - 2), { bold: true })
+      divider(n, 2, border, vt)
       if (n.kind === 'note') {
-        wrap(n.card.text || 'Write a note', inner, H - 3).forEach((l, i) => text(n.x + 2, n.y + 2 + i, l, { dim: !n.card.text }))
+        wrap(n.card.text || 'Write a note', inner, H - 4).forEach((l, i) => text(n.x + 2, n.y + 3 + i, l, { dim: !n.card.text }))
       } else {
-        text(n.x + 2, n.y + 2, clip(n.summary, inner), { dim: true })
+        socketLabels(n, SOCKET_ROW.other, canLinkTo(n), n.ports.length === 1)
+        const extra = (n.kind === 'all' && n.waiting) || (n.kind === 'end' && n.result)
+        wrap(n.summary, inner, extra ? 1 : 2).forEach((l, i) => text(n.x + 2, n.y + 4 + i, l, { dim: true }))
+        if (n.kind === 'all' && n.waiting) {
+          text(n.x + 2, n.y + 5, `waiting ${n.waiting.got} of ${n.waiting.of}`, { color: 'yellow' })
+        } else if (n.kind === 'end' && n.result) {
+          text(n.x + 2, n.y + 5, `✓ ${clip(oneLine(plain(n.result.text)), inner - 2)}`, { color: 'green' })
+        }
         if (n.ports.length > 1) {
+          divider(n, 6, border, vt)
           // Each output: its name and a dot on the right edge, where its links leave.
           n.ports.forEach(port => {
             const label = `${clip(portLabel(port), inner - 2)} ●`
             const isPicked = isSource && props.connectPort === port
             text(n.x + W - 2 - label.length, n.y + rowAt(n, port), label, { color: isPicked ? 'magenta' : m.color, bold: isPicked })
           })
-        } else if (n.kind === 'all' && n.waiting) {
-          text(n.x + 2, n.y + 3, `waiting ${n.waiting.got} of ${n.waiting.of}`, { color: 'yellow' })
-        } else if (n.kind === 'end' && n.result) {
-          wrap(n.result.text, inner, 2).forEach((l, i) => text(n.x + 2, n.y + 3 + i, i === 0 ? `✓ ${clip(l, inner - 2)}` : l, { color: 'green' }))
         }
       }
     }
@@ -618,12 +885,51 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
     // The input dot on the left edge: filled once something links in.
     if (canLinkTo(n)) {
       const hasIn = props.edges.some(e => e.to === n.id && !e.isModel)
-      put(n.x, n.y + IN_ROW, { ch: hasIn ? '◉' : '○', color: isDropTarget ? 'magenta' : m.color === 'white' ? 'cyan' : m.color, bold: true })
+      put(n.x, n.y + inRowAt(n, g), { ch: hasIn ? '◉' : '○', color: isDropTarget ? 'magenta' : m.color === 'white' ? 'cyan' : m.color, bold: true })
     }
     // An agent's model dot, under its input: filled once a Model card links in.
     if (isAgent) put(n.x, n.y + M_ROW, { ch: n.model ? '◉' : '○', color: 'blue', bold: true })
     // A wiring problem, on the bottom edge.
     if (n.warning) text(n.x + 2, n.y + H - 1, clip(` ⚠ ${n.warning} `, W - 4), { color: 'yellow' })
+  }
+
+  // The selected agent's activity drawer, hung under its card and wider than it:
+  // its thinking while it works, the prompt it's on, and its newest lines, wrapped.
+  let drawer: { x: number; y: number; w: number; ht: number; chatRow: number } | null = null
+  const opened = selNode?.kind === 'agent' && !g.isCompact ? nodes.find(n => n.id === selNode.id) : undefined
+  if (opened && (opened.preview.length || opened.thinking)) {
+    const n = opened
+    const w = Math.max(W, Math.min(DRAWER_W, cols - leftW - rightW - 4))
+    const inner = w - 4
+    const prompt = n.preview.find(p => p.startsWith('▸'))
+    const thinking = n.status === 'running' && n.thinking?.trim() ? wrapTail(plain(n.thinking), inner - 2, 3) : []
+    const head: { text: string; style: Omit<Cell, 'ch'> }[] = [
+      ...(prompt ? wrap(plain(prompt), inner, 2).map(t => ({ text: t, style: { color: 'cyan' } })) : []),
+      ...thinking.map(t => ({ text: `∴ ${t}`, style: { dim: true } })),
+    ]
+    const tail = activityTail(n.preview, inner, Math.max(3, DRAWER_ROWS - head.length))
+    const body = [...head, ...tail.map(t => ({ text: t, style: t.startsWith('⚙') ? { color: 'blue' } : {} }))]
+    const ht = body.length + 3
+    const x = n.x
+    const y = n.y + n.ht - 1
+    const color = 'cyan'
+    // Joined to the card: its bottom edge becomes the drawer's top.
+    put(x, y, { ch: '┣', color })
+    for (let dx = 1; dx < w - 1; dx++) put(x + dx, y, { ch: dx < W - 1 ? '━' : '─', color })
+    put(x + W - 1, y, { ch: w > W ? '┻' : '┫', color })
+    put(x + w - 1, y, { ch: w > W ? '╮' : '┫', color })
+    for (let dy = 1; dy < ht - 1; dy++) {
+      put(x, y + dy, { ch: '┃', color })
+      put(x + w - 1, y + dy, { ch: '│', color })
+      for (let dx = 1; dx < w - 1; dx++) put(x + dx, y + dy, { ch: ' ' })
+    }
+    put(x, y + ht - 1, { ch: '┗', color })
+    for (let dx = 1; dx < w - 1; dx++) put(x + dx, y + ht - 1, { ch: '─', color })
+    put(x + w - 1, y + ht - 1, { ch: '╯', color })
+    body.forEach((l, i) => text(x + 2, y + 1 + i, clip(l.text, inner), l.style))
+    const hint = 'View chat (v) for all of it ›'
+    text(x + 2, y + ht - 2, hint, { color: 'cyan', dim: true })
+    drawer = { x, y, w, ht, chatRow: y + ht - 2 }
   }
 
   // The link being dragged: from its dot to the pointer, across then down.
@@ -676,20 +982,66 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
 
   // ---------- details panel (right) ----------
   const panelInner = RIGHT_W - 4
+  /** A dim hint for the details panel, wrapped rather than cut. */
+  const note = (text: string): Row[] => wrap(text, panelInner, 3).map(l => row(l, { dim: true }))
+  /**
+   * Buttons two to a row, each the same width, so their brackets line up down the
+   * panel. Symbols that some fonts draw two cells wide (⧉ ☰) are kept out of labels.
+   */
+  const buttonGrid = (items: GridButton[]): Row[] => {
+    const w = Math.floor((panelInner - 2) / 2)
+    const cell = ([label, act, color]: GridButton): Seg => ({ text: `[ ${clip(label, w - 4).padEnd(w - 4)} ]`, act, color, bold: true })
+    const out: Row[] = []
+    for (let i = 0; i < items.length; i += 2) {
+      out.push({ segs: [cell(items[i]!), ...(items[i + 1] ? [gap(2), cell(items[i + 1]!)] : [])] })
+    }
+    return out
+  }
+  /** The layout of the multi-line box being typed in, for up and down. */
+  let activeLines: Line[] | undefined
+  /**
+   * A text box being typed in, as rows: scrolled to keep the cursor in view and
+   * drawn with it; a click on a row puts the cursor there.
+   */
+  const boxRows = (c: Caret, width: number, lines: number, place: (pos: number) => void, color = 'yellow'): Row[] => {
+    if (lines <= 1) {
+      const w = Math.max(2, width - 1)
+      const start = c.pos < w ? 0 : c.pos - w + 1
+      const line = { start, text: c.text.slice(start, start + w) }
+      const col = c.pos - start
+      const shown = line.text.slice(0, col) + CARET + line.text.slice(col)
+      return [{ segs: [{ text: start > 0 ? '…' + shown.slice(1) : shown, color, act: dx => place(posIn(line, dx, col)) }] }]
+    }
+    const all = layoutText(c.text, width - 1)
+    activeLines = all
+    const ci = lineAt(all, c.pos)
+    const first = Math.max(0, ci - lines + 1)
+    return all.slice(first, first + lines).map((line, j) => {
+      const col = first + j === ci ? c.pos - line.start : null
+      const shown = col === null ? line.text : line.text.slice(0, col) + CARET + line.text.slice(col)
+      return { segs: [{ text: shown || ' ', color, act: dx => place(posIn(line, dx, col)) }] }
+    })
+  }
+  /** A box's text when it isn't being typed in: click a spot to start typing there. */
+  const valueRows = (value: string, width: number, lines: number, begin?: (pos: number) => void): Row[] => {
+    if (lines <= 1) return [{ segs: [{ text: clip(value, width), act: begin && (dx => begin(Math.min(dx, value.length))) }] }]
+    const all = layoutText(value, width)
+    return all.slice(0, lines).map((line, j) => ({
+      segs: [{ text: j === lines - 1 && all.length > lines ? clip(line.text + ' …', width) : line.text, act: begin && (dx => begin(posIn(line, dx, null))) }],
+    }))
+  }
   const field = (
     label: string, value: string, kind: Edit['kind'] | null, id: string, placeholder: string, lines = 1, cardField?: string,
   ): Row[] => {
     const typing = edit && edit.kind === kind && edit.id === id && edit.field === cardField ? edit : null
-    const start = kind ? () => set({ edit: { kind, id, text: value, ...(cardField ? { field: cardField } : {}) } }) : undefined
+    const begin = kind ? (pos: number) => set({ edit: { kind, id, text: value, pos, ...(cardField ? { field: cardField } : {}) } }) : undefined
     const out: Row[] = [heading(label)]
     if (typing) {
-      const shown = lines > 1 ? wrapTail(typing.text + '▏', panelInner, lines) : [clipStart(typing.text, panelInner - 1) + '▏']
-      shown.forEach(l => out.push(row(l, { color: 'yellow' })))
-      out.push(row(typing.text !== value ? 'Enter to save · click away to cancel' : kind === 'prompt' && !value ? 'Type what Run sends, then Enter' : 'Type to edit', { dim: true }))
-    } else {
-      const shown = value ? (lines > 1 ? wrap(value, panelInner, lines) : [clip(value, panelInner)]) : [placeholder]
-      shown.forEach(l => out.push(row(l, { dim: !value, act: start })))
-    }
+      out.push(...boxRows(caretOf(typing), panelInner, lines, pos => set({ edit: { ...typing, pos } })))
+      out.push(row(typing.text !== value ? 'Enter or click away to save' : '← → move · click to place · Cmd+V paste', { dim: true }))
+    } else if (!value) {
+      wrap(placeholder, panelInner, lines).forEach(l => out.push({ segs: [{ text: l, dim: true, act: begin && (() => begin(0)) }] }))
+    } else out.push(...valueRows(value, panelInner, lines, begin))
     return out
   }
 
@@ -773,9 +1125,9 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
         ...field('COMMAND', n.prompt, 'card', n.id, 'What the run begins with, e.g. "List all countries"', 4, 'prompt'),
         blank(),
         { segs: [button('▶ Run flow', () => runFlowNow(), 'green')] },
-        row('Sends the command to what this links to.', { dim: true }),
+        ...note('Sends the command to what this links to.'),
       ]
-      : n.kind === 'if' ? [...checkRows(), blank(), row('Yes or No: where the message goes next.', { dim: true })]
+      : n.kind === 'if' ? [...checkRows(), blank(), ...note('Yes or No: where the message goes next.')]
       : n.kind === 'loop' ? [
         ...checkRows(),
         blank(),
@@ -788,28 +1140,25 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
             { text: '  then Done anyway', dim: true },
           ],
         },
-        row('Again: link back to the agent to retry.', { dim: true }),
+        ...note('Again: link back to the agent to retry.'),
       ]
       : n.kind === 'switch' ? [
         ...field('BRANCHES (comma-separated)', (c.branches ?? []).join(', '), 'card', n.id, 'e.g. bug, feature, question', 2, 'branches'),
-        row('Claude picks one; none fits → Other.', { dim: true }),
+        ...note('Claude picks one; none fits → Other.'),
       ]
       : n.kind === 'prompt' ? [
-        ...cardField('PROMPT', 'template', c.template ?? '', 'e.g. Summarise for a designer: {{message}}', 5),
-        row('{{message}} = what came in · {{from}} = who', { dim: true }),
+        ...cardField('PROMPT', 'template', c.template ?? '', 'e.g. Summarise this for a designer', 5),
+        ...note('What came in goes under your text, or where you write {{message}}. {{from}}: who sent it.'),
       ]
       : n.kind === 'all' ? [
-        row('Waits until every card linking in has', { dim: true }),
-        row('replied in this run, then passes their', { dim: true }),
-        row('answers on together.', { dim: true }),
+        ...note('Waits until every card linking in has replied in this run, then passes their answers on together.'),
         blank(),
         heading('INPUTS'),
         ...[...new Set(props.edges.filter(e => e.to === n.id).map(e => e.from))].map(id => row(`← ${clip(nameOf(id), panelInner - 2)}`)),
         ...(n.waiting ? [blank(), row(`Waiting: ${n.waiting.got} of ${n.waiting.of} in`, { color: 'yellow' }), { segs: [button('Pass on now', () => send({ t: 'all-flush', id: n.id }), 'yellow')] }] : []),
       ]
       : n.kind === 'first' ? [
-        row('Passes on the first reply to arrive in', { dim: true }),
-        row('a run; later ones are dropped.', { dim: true }),
+        ...note('Passes on the first reply to arrive in a run; later ones are dropped.'),
       ]
       : n.kind === 'end' ? [
         ...cardField('SAVE TO (optional)', 'saveTo', c.saveTo ?? '', 'e.g. results/countries.md', 1),
@@ -838,13 +1187,22 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
     const inc = props.edges.filter(e => e.to === n.id && e.from !== n.id)
     const body: Row[] = [
       row(`${STATUS_ICON[n.status]} ${statusWord(n)}`, {
-        color: STATUS_COLOR[n.status],
+        ...pulse(n),
         right: { text: n.isOpen ? '⧉ open in a tab' : n.hasSession ? 'not open' : 'new', dim: !n.isOpen, color: n.isOpen ? 'green' : undefined },
       }),
       blank(),
+      ...buttonGrid([
+        ['▶ Test', () => testAgent(n), 'green'],
+        ['View chat', () => send({ t: 'chat', id: n.id }), 'cyan'],
+        ['Open in tab', () => send({ t: 'open', id: n.id }), 'cyan'],
+        ['→ Link to…', () => send({ t: 'connect-start', id: n.id }), 'magenta'],
+        ...(n.status === 'running' ? [['■ Stop', () => send({ t: 'stop', id: n.id }), 'yellow'] as GridButton] : []),
+      ]),
+      blank(),
       ...field('NAME', n.name, 'name', n.id, ''),
       blank(),
-      ...field('RUN PROMPT', n.prompt, 'prompt', n.id, 'Click to write what Run sends', 4),
+      ...field('INSTRUCTIONS', n.instructions, 'instructions', n.id, 'Its role, e.g. "You review lists. Reply APPROVED or list the problems."', 5),
+      ...note('Sent ahead of every message it gets. A line like @CLAUDE.md adds that file.'),
       blank(),
       heading('PERMISSIONS'),
       {
@@ -861,13 +1219,7 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
       blank(),
       heading('MODEL'),
       row(n.model ? `◈ ${n.model}` : 'Your default model', { color: n.model ? 'blue' : undefined, dim: !n.model }),
-      row(
-        !n.model ? 'Link a Model card to its lower dot.' : n.isOpen ? 'Open in a tab: uses the model it opened with.' : 'Used on its next run or open.',
-        { dim: true },
-      ),
-      blank(),
-      { segs: [button('▶ Run', () => (n.prompt.trim() ? send({ t: 'run', id: n.id }) : set({ edit: { kind: 'prompt', id: n.id, text: '' } })), 'green'), gap(), button('⧉ Open chat', () => send({ t: 'open', id: n.id }))] },
-      { segs: [button('→ Link to…', () => send({ t: 'connect-start', id: n.id }), 'magenta'), ...(n.status === 'running' ? [gap(), button('■ Stop', () => send({ t: 'stop', id: n.id }), 'yellow')] : [])] },
+      ...note(!n.model ? 'Link a Model card to its lower dot.' : n.isOpen ? 'Open in a tab: used from its next message.' : 'Used on its next run or open.'),
       blank(),
       heading('LINKS'),
       ...(out.length + inc.length === 0 ? [row('None yet', { dim: true })] : []),
@@ -890,9 +1242,7 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
     ] : [
       row(`${clip(e.fromName, 14)}${e.port !== 'out' ? ` (${portLabel(e.port)})` : ''}  →  ${clip(e.toName, 14)}`, { bold: true }),
       blank(),
-      row('Carries every message. To decide where', { dim: true }),
-      row('messages go, put an If or Switch card', { dim: true }),
-      row('on the link.', { dim: true }),
+      ...note('Carries every message. To decide where messages go, put an If or Switch card on the link.'),
       blank(),
       heading('MAX PASSES'),
       {
@@ -934,6 +1284,7 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
         { segs: [{ text: 'n', bold: true, color: 'cyan' }, { text: ' add card   ' }, { text: 'a', bold: true, color: 'cyan' }, { text: ' add running' }] },
         { segs: [{ text: 'c', bold: true, color: 'cyan' }, { text: ' link       ' }, { text: 'r', bold: true, color: 'cyan' }, { text: ' run' }] },
         { segs: [{ text: 'o', bold: true, color: 'cyan' }, { text: ' open chat  ' }, { text: 'x', bold: true, color: 'cyan' }, { text: ' delete' }] },
+        { segs: [{ text: 'v', bold: true, color: 'cyan' }, { text: ' view chat' }] },
         { segs: [{ text: '+ -', bold: true, color: 'cyan' }, { text: ' zoom     ' }, { text: '0', bold: true, color: 'cyan' }, { text: ' 100%' }] },
       ],
       footer: [
@@ -970,7 +1321,10 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
   }
   if (details) {
     const w = rightW || Math.min(RIGHT_W, cols)
-    drawPanel(cols - w, 0, w, details.title, details.body, { ht: rows, color: details.color, footer: details.footer })
+    detailRange = drawPanel(cols - w, 0, w, details.title, details.body, {
+      ht: rows, color: details.color, footer: details.footer,
+      scroll: { top: detailTop, to: top => set({ detailTop: top, detailFor: selId }) },
+    })
   }
 
   // ---------- flows list (left) ----------
@@ -992,7 +1346,7 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
         list.push({
           segs: [
             n.kind === 'agent'
-              ? { text: '  ' + STATUS_ICON[n.status] + ' ', color: STATUS_COLOR[n.status], dim: !STATUS_COLOR[n.status] }
+              ? { text: '  ' + (n.status === 'running' ? '●' : STATUS_ICON[n.status]) + ' ', ...pulse(n) }
               : { text: '  ' + metaOf(n.kind).icon + ' ', color: metaOf(n.kind).color },
             { text: clipMid(n.name, listInner - 14), bold: selNode?.id === n.id, color: selNode?.id === n.id ? 'cyan' : undefined },
             { text: n.isOpen ? ' ⧉' : '', color: 'green' },
@@ -1075,15 +1429,31 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
     const q = browse.q
     const body: Row[] = [
       {
-        segs: [{ text: 'Search  ', dim: true }, { text: clipStart(q, inner - 10) + (editing ? '' : '▏'), color: 'yellow' }, ...(q || editing ? [] : [{ text: 'type to filter by name or folder', dim: true }])],
-        act: () => set({ browse: { ...browse, folder: null } }),
+        segs: [
+          { text: 'Search  ', dim: true, act: () => set({ browse: { ...browse, folder: null } }) },
+          ...(editing
+            ? [{ text: clip(q, inner - 10), color: 'yellow', act: (dx: number) => set({ browse: { ...browse, folder: null, qPos: Math.min(dx, q.length) } }) }]
+            : boxRows(caretOf({ text: q, pos: browse.qPos }), inner - 10, 1, pos => set({ browse: { ...browse, qPos: pos } }))[0]!.segs),
+          ...(q || editing ? [] : [{ text: 'type to filter by name or folder', dim: true }]),
+        ],
       },
       editing
-        ? { segs: [{ text: 'Folder  ', dim: true }, { text: clipStart(browse.folder ?? '', inner - 10) + '▏', color: 'yellow' }] }
+        ? {
+            segs: [
+              { text: 'Folder  ', dim: true },
+              ...boxRows(caretOf({ text: browse.folder ?? '', pos: browse.fPos }), inner - 10, 1, pos => set({ browse: { ...browse, fPos: pos } }))[0]!.segs,
+            ],
+          }
         : {
             segs: (() => {
-              const editFolder = () => set({ browse: { ...browse, folder: showPath(picker.dir, picker.home) } })
-              return [{ text: 'Folder  ', dim: true, act: editFolder }, { text: clipStart(showPath(picker.dir, picker.home), inner - 18), bold: true, act: editFolder }]
+              // The label starts typing at the end; the path itself, where it's clicked.
+              const path = showPath(picker.dir, picker.home)
+              const shown = clipStart(path, inner - 18)
+              const editFolder = (pos = path.length) => set({ browse: { ...browse, folder: path, fPos: pos } })
+              return [
+                { text: 'Folder  ', dim: true, act: () => editFolder() },
+                { text: shown, bold: true, act: (dx: number) => editFolder(shown === path ? Math.min(dx, path.length) : path.length) },
+              ]
             })(),
             right: { text: '[ ↑ Up ]', color: picker.dir === '/' ? 'gray' : 'cyan', bold: true, act: () => send({ t: 'picker-dir', dir: parentOf(picker.dir) }) },
           },
@@ -1125,20 +1495,73 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
     drawPanel(Math.floor((cols - w) / 2), Math.max(0, Math.floor((rows - ht) / 2)), w, 'Add a card', body, { color: 'cyan', footer })
   }
 
-  // ---------- run flow: the command, pre-filled to edit ----------
-  if (edit?.kind === 'run') {
+  // ---------- run flow (the command) or test one agent (a message), pre-filled to edit ----------
+  if (edit?.kind === 'run' || edit?.kind === 'test') {
     const w = Math.min(64, cols - 4)
-    const shown = wrapTail(edit.text + '▏', w - 4, 5)
+    const isTest = edit.kind === 'test'
+    const who = nameOf(edit.id)
     const body: Row[] = [
-      row(`${openFlow?.name ?? 'Flow'}: the command this run starts with.`, { dim: true }),
+      row(isTest ? `A one-off message for ${who}, outside the flow.` : `${openFlow?.name ?? 'Flow'}: the command this run starts with.`, { dim: true }),
+      ...(isTest ? [row('Its instructions go with it.', { dim: true })] : []),
       blank(),
-      ...shown.map(l => row(l, { color: 'yellow' })),
+      ...boxRows(caretOf(edit), w - 4, 5, pos => set({ edit: { ...edit, pos } })),
       blank(),
-      row('Enter to run · click away to cancel', { dim: true }),
+      row('Enter to run · ← → move · Cmd+V paste · click away to cancel', { dim: true }),
     ]
     const footer: Row[] = [{ segs: [button('▶ Run', () => submitRun(), 'green'), gap(), button('Cancel', () => set({ edit: null }), 'gray')] }]
     const ht = body.length + footer.length + 2
-    drawPanel(Math.floor((cols - w) / 2), Math.max(0, Math.floor((rows - ht) / 2)), w, 'Run flow', body, { color: 'green', footer })
+    drawPanel(Math.floor((cols - w) / 2), Math.max(0, Math.floor((rows - ht) / 2)), w, isTest ? `Test ${who}` : 'Run flow', body, { color: 'green', footer })
+  }
+
+  // ---------- the read-only chat view, over the canvas ----------
+  const chat = props.chat
+  /** Where the chat view is drawn: a click outside it closes it. */
+  let chatBox: { x: number; y: number; w: number; ht: number } | null = null
+  const chatRows: Row[] = []
+  const chatPage = Math.max(4, rows - 6)
+  let chatScroll = (_to: number) => {}
+  let chatFirstShown = 0
+  const closeChat = () => {
+    set({ chatFirst: undefined, chatFor: undefined })
+    send({ t: 'chat', id: null })
+  }
+  if (chat) {
+    const w = Math.min(100, cols - 6)
+    const inner = w - 4
+    for (const m of chat.lines) {
+      const who = m.who === 'you' ? 'You' : m.who === 'peer' ? `From ${m.from || 'another chat'}` : chat.name
+      const color = m.who === 'you' ? 'cyan' : m.who === 'peer' ? 'magenta' : 'green'
+      chatRows.push(row(who, { bold: true, color }))
+      for (const l of wrapText(plain(m.text), inner, 400)) {
+        chatRows.push(row(l, l.startsWith('⚙') ? { color: 'blue', dim: true } : m.who === 'peer' ? { dim: true } : {}))
+      }
+      chatRows.push(blank())
+    }
+    if (!chatRows.length) chatRows.push(row(chat.note ?? 'Nothing in this chat yet.', { dim: true }))
+    const newest = Math.max(0, chatRows.length - chatPage)
+    // Scrolled back, the view holds its place as new messages arrive below.
+    const held = local.chatFor === chat.id ? local.chatFirst : undefined
+    const first = held === undefined ? newest : Math.min(held, newest)
+    const back = newest - first
+    chatScroll = (to: number) => set({ chatFirst: to >= newest ? undefined : Math.max(0, to), chatFor: chat.id })
+    const scrollBy = (n: number) => chatScroll(first - n)
+    const body = chatRows.slice(first, first + chatPage)
+    chatFirstShown = first
+    const footer: Row[] = [{
+      segs: [
+        { text: '▲ Older', bold: true, color: first > 0 ? 'cyan' : undefined, dim: first === 0, act: () => scrollBy(chatPage - 2) },
+        gap(2),
+        { text: '▼ Newer', bold: true, color: back > 0 ? 'cyan' : undefined, dim: back === 0, act: () => scrollBy(-(chatPage - 2)) },
+        gap(2),
+        button('✕ Close', () => closeChat(), 'gray'),
+        { text: back > 0 ? '  ↑ ↓ PgUp PgDn · End: newest' : '  following along · q closes', dim: true },
+      ],
+    }]
+    const ht = rows
+    const x = Math.floor((cols - w) / 2)
+    const live = chat.status === 'running' ? ' · ● working' : ''
+    drawPanel(x, 0, w, `${chat.name} · read-only${live}`, body, { color: 'green', footer, ht })
+    chatBox = { x, y: 0, w, ht }
   }
 
   // ---------- input ----------
@@ -1153,15 +1576,30 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
   }
   const edgeAt = (x: number, y: number) => edges.find(e => y === e.ly && x >= e.lx - 1 && x <= e.lx + e.label.length)
 
+  // A click that takes the cursor out of a text box keeps what was typed there: the
+  // next box (Run flow's command, say) opens with it, and nothing typed is lost.
   surface.onPointer(e => {
+    const before = local.edit
+    onPointer(e)
+    const after = changes.edit !== undefined ? changes.edit : local.edit
+    const sameBox = after && before && after.kind === before.kind && after.id === before.id && after.field === before.field
+    if (before && !sameBox) saveEdit(before)
+  })
+  function onPointer(e: ClientPointerEvent) {
     const w = toView(e)
     if (e.type === 'down' && e.button === 'left') {
+      if (chatBox && !(e.x >= chatBox.x && e.x < chatBox.x + chatBox.w && e.y >= chatBox.y && e.y < chatBox.y + chatBox.ht)) return closeChat()
       const panel = panelAt(e.x, e.y)
+      // The drawer is the card's: its last line opens the chat view; the rest selects nothing new.
+      if (!panel && drawer && w.x >= drawer.x && w.x < drawer.x + drawer.w && w.y > drawer.y && w.y < drawer.y + drawer.ht) {
+        if (w.y === drawer.chatRow && selNode) send({ t: 'chat', id: selNode.id })
+        return
+      }
       if (panel) {
         // A click inside a panel is the panel's; clicking anything but the field being typed in ends typing.
         const hit = [...panel.hits].reverse().find(ht => ht.y === e.y && e.x >= ht.x1 && e.x <= ht.x2)
         if (local.edit && !hit) set({ edit: null })
-        hit?.act()
+        hit?.act(e.x - hit.x1)
         return
       }
       if (props.picker) {
@@ -1188,6 +1626,14 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
           set({ drag: null, edit: null })
           return
         }
+        // An agent card's See response / Watch live: selects it and opens its chat view.
+        const cta = hit.kind === 'agent' && !g.isCompact ? agentCta(hit) : null
+        if (cta?.opens && w.y === hit.y + hit.ht - 2 && w.x >= hit.x + 2 && w.x < hit.x + 2 + cta.text.length) {
+          send({ t: 'select', sel: { kind: 'node', id: hit.id } })
+          send({ t: 'chat', id: hit.id })
+          set({ drag: null, edit: null })
+          return
+        }
         // An output dot: drag out a link (or click, then click the target, as before).
         const port = portAt(hit, w.x, w.y)
         if (port && canLinkFrom(hit)) {
@@ -1205,7 +1651,7 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
         // An input dot: drag back onto the card this one should hear from.
         if (isInputAt(hit, w.x, w.y)) {
           send({ t: 'select', sel: { kind: 'node', id: hit.id } })
-          set({ edit: null, notice: null, drag: { kind: 'link', dir: 'in', from: hit.id, port: '', sx: hit.x - 1, sy: hit.y + IN_ROW, x: w.x, y: w.y, moved: false } })
+          set({ edit: null, notice: null, drag: { kind: 'link', dir: 'in', from: hit.id, port: '', sx: hit.x - 1, sy: hit.y + inRowAt(hit, g), x: w.x, y: w.y, moved: false } })
           return
         }
         const now = Date.now()
@@ -1260,7 +1706,7 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
       }
       set({ drag: null, notice })
     }
-  })
+  }
 
   surface.onKey((k: ClientKeyEvent) => {
     const sel = props.selected
@@ -1270,16 +1716,30 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
       if (key === 'escape') set({ menu: false })
       return
     }
+    // The chat view takes the keys while open: scroll it, or q to close.
+    if (chat) {
+      const at = chatFirstShown
+      if (key === 'up') chatScroll(at - 1)
+      else if (key === 'down') chatScroll(at + 1)
+      else if (key === 'pageup') chatScroll(at - chatPage + 2)
+      else if (key === 'pagedown') chatScroll(at + chatPage - 2)
+      else if (key === 'home') chatScroll(0)
+      else if (key === 'end') chatScroll(Infinity)
+      else if (key === 'q' || key === 'escape') closeChat()
+      return
+    }
     // The browser takes every key while open: its folder box, else its search and list.
     if (picker && browse) {
-      const text = typedText(k)
+      if (isPasteKey(k)) return askPaste()
       if (browse.folder !== null) {
         if (key === 'escape') set({ browse: { ...browse, folder: null } })
         else if (key === 'return') {
           send({ t: 'picker-dir', dir: browse.folder })
           set({ browse: { ...browse, folder: null } })
-        } else if (key === 'backspace' || key === 'delete') set({ browse: { ...browse, folder: browse.folder.slice(0, -1) } })
-        else if (text !== null) set({ browse: { ...browse, folder: browse.folder + text } })
+        } else {
+          const next = keyInto(caretOf({ text: browse.folder, pos: browse.fPos }), k)
+          if (next) set({ browse: { ...browse, folder: next.text, fPos: next.pos } })
+        }
         return
       }
       if (key === 'escape') send({ t: 'picker', open: false })
@@ -1288,27 +1748,27 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
       else if (key === 'pageup') moveTo(browse.hi - shownRows)
       else if (key === 'pagedown') moveTo(browse.hi + shownRows)
       else if (key === 'return') choose(items[browse.hi])
-      else if (key === 'backspace' || key === 'delete') set({ browse: { ...browse, q: browse.q.slice(0, -1), hi: 0, top: 0 } })
-      else if (text !== null) set({ browse: { ...browse, q: browse.q + text, hi: 0, top: 0 } })
+      else {
+        const next = keyInto(caretOf({ text: browse.q, pos: browse.qPos }), k)
+        if (next) set({ browse: { ...browse, q: next.text, qPos: next.pos, ...(next.text !== browse.q ? { hi: 0, top: 0 } : {}) } })
+      }
       return
     }
     if (edit) {
       if (key === 'escape') return set({ edit: null })
       if (key === 'return') {
-        if (edit.kind === 'run') return submitRun()
-        if (edit.kind === 'flow-name') send({ t: 'flow-patch', id: edit.id, patch: { name: edit.text } })
-        else if (edit.kind === 'card' && edit.field) {
-          const value = edit.field === 'branches' ? edit.text.split(',').map(b => b.trim()).filter(Boolean) : edit.text
-          send({ t: 'card', id: edit.id, patch: { [edit.field]: value } })
-        } else send({ t: 'node', id: edit.id, patch: { [edit.kind]: edit.text } })
+        if (edit.kind === 'run' || edit.kind === 'test') return submitRun()
+        saveEdit(edit)
         set({ edit: null })
-      } else if (key === 'backspace' || key === 'delete') {
-        set({ edit: { ...edit, text: edit.text.slice(0, -1) } })
-      } else if (typedText(k) !== null) {
-        set({ edit: { ...edit, text: edit.text + typedText(k) } })
+      } else if (isPasteKey(k)) askPaste()
+      else {
+        const next = keyInto(caretOf(edit), k, activeLines)
+        if (next) set({ edit: { ...edit, text: next.text, pos: next.pos } })
       }
       return
     }
+    if (key === 'pagedown') return pageDetails(1)
+    if (key === 'pageup') return pageDetails(-1)
     if (key === '+' || key === '=') zoomStep(1)
     else if (key === '-' || key === '_') zoomStep(-1)
     else if (key === '0') zoomTo(1)
@@ -1324,10 +1784,10 @@ const Canvas: ClientModule<CanvasProps, Local> = (props, surface) => {
       const n = nodes.find(one => one.id === sel.id)
       if (n?.kind === 'start') runFlowNow()
       else if (n && n.kind !== 'agent') return
-      else if (n && !n.prompt.trim()) set({ edit: { kind: 'prompt', id: n.id, text: '' } })
-      else send({ t: 'run', id: sel.id })
+      else if (n) testAgent(n)
     }
     else if ((key === 'o' || key === 'return') && sel.kind === 'node' && nodes.find(n => n.id === sel.id)?.kind === 'agent') send({ t: 'open', id: sel.id })
+    else if (key === 'v' && sel.kind === 'node' && nodes.find(n => n.id === sel.id)?.kind === 'agent') send({ t: 'chat', id: sel.id })
     else if (['up', 'down', 'left', 'right'].includes(key) && sel.kind === 'node') {
       const n = worldNodes.find(one => one.id === sel.id)
       if (!n) return

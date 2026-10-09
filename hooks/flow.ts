@@ -1,11 +1,13 @@
-import type { FlowEdge } from '../types'
+import type { ChatLine, FlowEdge } from '../types'
+import { resolveDir } from './picker'
 
 export type StreamEvent =
   | { kind: 'preview'; lines: string[] }
   | { kind: 'result'; text: string; isError: boolean }
   /** Claude has loaded (its plugins and MCP servers) and begun the turn. */
   | { kind: 'started' }
-  | { kind: 'thinking' }
+  /** A piece of Claude's thinking, as it is written; '' where thinking is hidden. */
+  | { kind: 'thinking'; text: string }
   /** A piece of the reply's text, as it is written (`--include-partial-messages`). */
   | { kind: 'delta'; text: string }
 
@@ -33,7 +35,7 @@ export function parseStreamLine(line: string): StreamEvent | null {
   if (msg?.type === 'stream_event' && msg.event?.type === 'content_block_delta') {
     const d = msg.event.delta
     if (d?.type === 'text_delta' && typeof d.text === 'string') return { kind: 'delta', text: d.text }
-    if (d?.type === 'thinking_delta') return { kind: 'thinking' }
+    if (d?.type === 'thinking_delta') return { kind: 'thinking', text: typeof d.thinking === 'string' ? d.thinking : '' }
     return null
   }
   if (msg?.type === 'result') {
@@ -46,19 +48,26 @@ export function parseStreamLine(line: string): StreamEvent | null {
  * What a background run's card shows while it runs: the finished lines, then the
  * message being written, or what Claude is doing before any text comes.
  */
-export type Live = { lines: string[]; draft: string; phase: 'starting' | 'waiting' | 'thinking' | 'writing' }
+export type Live = { lines: string[]; draft: string; phase: 'starting' | 'waiting' | 'thinking' | 'writing'; thinking: string }
 
-const PREVIEW_LINES = 6
+/** Lines of activity kept: the card shows the last few, the side panel's LIVE section all of them. */
+export const PREVIEW_LINES = 8
+/** The tail of the latest thinking kept, for the side panel. */
+export const THINKING_CHARS = 1200
 
-export const startLive = (first: string): Live => ({ lines: [first], draft: '', phase: 'starting' })
+export const startLive = (first: string): Live => ({ lines: [first], draft: '', phase: 'starting', thinking: '' })
 
 export function applyLive(live: Live, ev: StreamEvent): Live {
   switch (ev.kind) {
     case 'started': return { ...live, phase: 'waiting' }
-    case 'thinking': return live.draft ? live : { ...live, phase: 'thinking' }
+    case 'thinking': {
+      // A new stretch of thinking (after text was written) starts afresh.
+      const thinking = (live.phase === 'thinking' ? live.thinking + ev.text : ev.text).slice(-THINKING_CHARS)
+      return live.draft ? { ...live, thinking } : { ...live, phase: 'thinking', thinking }
+    }
     case 'delta': return { ...live, draft: live.draft + ev.text, phase: 'writing' }
     // A finished message replaces its draft, so nothing shows twice.
-    case 'preview': return { lines: [...live.lines, ...ev.lines].slice(-PREVIEW_LINES), draft: '', phase: 'waiting' }
+    case 'preview': return { ...live, lines: [...live.lines, ...ev.lines].slice(-PREVIEW_LINES), draft: '', phase: 'waiting' }
     default: return live
   }
 }
@@ -110,7 +119,7 @@ export const fillTemplate = (template: string, vars: { output: string; from: str
 
 export const shellQuote = (s: string) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replaceAll("'", `'\\''`)}'`)
 
-export type TranscriptView = { status: 'running' | 'done' | 'idle'; preview: string[]; lastOutput: string }
+export type TranscriptView = { status: 'running' | 'done' | 'idle'; preview: string[]; lastOutput: string; thinking: string }
 
 /**
  * Reads the tail of a session's transcript (.jsonl) into a canvas preview:
@@ -158,9 +167,14 @@ export function parseTranscript(tail: string, isStale: boolean): TranscriptView 
   const status = isTurnOver ? 'done' : isStale ? 'idle' : 'running'
   const clean = (s: string) => s.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
 
+  // The turn's latest thinking: the last thinking block written since the prompt.
+  const thoughts = replies.flatMap(m =>
+    Array.isArray(m.content) ? m.content.filter((b: any) => b?.type === 'thinking' && typeof b.thinking === 'string').map((b: any) => b.thinking as string) : [],
+  )
   return {
     status,
-    preview: [...(prompt ? ['▸ ' + clean(prompt)] : []), ...lines.slice(-5)],
+    preview: [...(prompt ? ['▸ ' + clean(prompt)] : []), ...lines.slice(-(PREVIEW_LINES - 1))],
+    thinking: (thoughts.at(-1) ?? '').slice(-THINKING_CHARS),
     lastOutput: replies
       .flatMap(m => (Array.isArray(m.content) ? m.content.filter((b: any) => b?.type === 'text').map((b: any) => b.text) : []))
       .join('\n'),
@@ -229,4 +243,120 @@ export function peerSection(
 }
 
 // Card size in cells; keep in step with NODE_W / NODE_H in canvas.tsx.
-export const CARD = { w: 28, ht: 6 }
+export const CARD = { w: 28, ht: 10 }
+
+/**
+ * An agent's instructions: a standing brief sent ahead of every message it gets in
+ * a flow. A line that is only `@path` adds that file in its place, so an agent can
+ * be grounded on a CLAUDE.md or AGENTS.md.
+ */
+export const instructionRefs = (text: string): string[] =>
+  [...new Set(text.split('\n').map(l => /^\s*@(\S+)\s*$/.exec(l)?.[1]).filter((r): r is string => !!r))]
+
+const FILE_CAP = 40000
+const TOTAL_CAP = 100000
+
+/**
+ * Where an `@path` points, or null when it may not be read: only files inside the
+ * project or the agent's own folder, or `.md` files under `~/.claude`. A flow can
+ * come from someone else, so its instructions can't reach a key or a token.
+ */
+export function resolveRef(ref: string, home: string, root: string, cwd: string): string | null {
+  const path = resolveDir(ref, home, cwd)
+  const under = (dir: string) => path.startsWith(dir.endsWith('/') ? dir : dir + '/')
+  if (under(root) || under(cwd)) return path
+  if (under(`${home}/.claude`) && path.toLowerCase().endsWith('.md')) return path
+  return null
+}
+
+export type RefFile = { path: string; content: string } | { error: string }
+
+/** The block sent ahead of a message: the instructions, each `@path` line replaced by its file. */
+export function composeInstructions(name: string, text: string, files: Record<string, RefFile>): { text: string; problems: string[] } {
+  const problems: string[] = []
+  let room = TOTAL_CAP
+  const body = text.split('\n').map(line => {
+    const ref = /^\s*@(\S+)\s*$/.exec(line)?.[1]
+    const f = ref ? files[ref] : undefined
+    if (!ref || !f) return line
+    if ('error' in f) {
+      const why = `@${ref} wasn't added: ${f.error}`
+      problems.push(why)
+      return `(${why})`
+    }
+    const cap = Math.max(0, Math.min(FILE_CAP, room))
+    const isCut = f.content.length > cap
+    room -= Math.min(f.content.length, cap)
+    return `<file path="${f.path}">\n${f.content.slice(0, cap).replace(/\n$/, '')}${isCut ? `\n(cut at ${cap} characters)` : ''}\n</file>`
+  })
+  return { text: [`[Agent Flows · your instructions as ${name}]`, ...body, '[End of instructions. The message follows.]'].join('\n'), problems }
+}
+
+/**
+ * The cmux tab (its surface id) showing terminal `tty`, read from `cmux tree --all
+ * --id-format both`; null when no tab shows it (the chat runs in another app).
+ */
+export function surfaceForTty(tree: string, tty: string): string | null {
+  const name = tty.trim().replace(/^\/dev\//, '')
+  if (!/^tty/.test(name)) return null
+  for (const line of tree.split('\n')) {
+    if (!new RegExp(`\\btty=${name}(\\s|$)`).test(line)) continue
+    const id = /surface:\d+\s+([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})/i.exec(line)?.[1]
+    if (id) return id
+  }
+  return null
+}
+
+
+/** Messages a chat view keeps, newest last, and the characters across them. */
+const CHAT_MESSAGES = 60
+const CHAT_CHARS = 40000
+
+/**
+ * A transcript's tail as a chat to read: what was typed, what agents and runs
+ * sent it (named), and its replies, tool calls as `⚙ name`. Commands, their
+ * output and tool results are left out.
+ */
+export function parseChat(tail: string): ChatLine[] {
+  const out: ChatLine[] = []
+  for (const line of tail.split('\n')) {
+    if (!line.trim()) continue
+    let row: any
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if ((row?.type !== 'user' && row?.type !== 'assistant') || !row.message || row.isMeta) continue
+    const content = row.message.content
+    if (row.type === 'assistant') {
+      const parts = Array.isArray(content)
+        ? content.flatMap((b: any) => (b?.type === 'text' ? [b.text] : b?.type === 'tool_use' ? [`⚙ ${b.name}`] : []))
+        : typeof content === 'string' ? [content] : []
+      const text = parts.join('\n').trim()
+      if (!text) continue
+      // Tool calls in a row share one line: ⚙ Read · ⚙ Grep.
+      const prev = out.at(-1)
+      if (prev?.who === 'agent' && /^⚙ /.test(text) && /^⚙ [^\n]*$/.test(prev.text.split('\n').at(-1) ?? '')) prev.text += ` · ${text}`
+      else out.push({ who: 'agent', text })
+      continue
+    }
+    const text = typeof content === 'string'
+      ? content
+      : Array.isArray(content) ? content.filter((b: any) => b?.type === 'text').map((b: any) => b.text).join('\n') : ''
+    if (!text.trim() || /^<(local-command|command-name|command-message|system-reminder)/.test(text.trim())) continue
+    const peer = /<cross-session-message[^>]*from-name="([^"]*)"[^>]*>([\s\S]*?)<\/cross-session-message>/.exec(text)
+    if (peer) out.push({ who: 'peer', from: peer[1], text: peer[2]!.trim() })
+    else out.push({ who: 'you', text: text.replace(/<[^>]+>/g, '').trim() })
+  }
+  // The newest messages, within the character budget.
+  const kept: ChatLine[] = []
+  let chars = 0
+  for (const m of out.slice(-CHAT_MESSAGES).reverse()) {
+    const text = m.text.length > CHAT_CHARS / 4 ? `${m.text.slice(0, CHAT_CHARS / 4)}\n… (cut here; the rest is in the chat)` : m.text
+    if (chars + text.length > CHAT_CHARS) break
+    chars += text.length
+    kept.unshift({ ...m, text })
+  }
+  return kept
+}

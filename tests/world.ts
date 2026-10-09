@@ -18,6 +18,10 @@ export type World = {
   self: { id: string }
   /** What Claude answers a routing question; the default says YES. */
   answer: { fn: (prompt: string) => string }
+  /** What macOS's pbpaste hands back: the clipboard. */
+  clipboard: { text: string }
+  /** cmux: the tab tree it reports, and every command run with it. */
+  cmux: { tree: string; ran: string[][] }
 }
 
 export const agent = (id: string, name: string, sessionId: string, x = 0, y = 0) =>
@@ -33,7 +37,7 @@ let clock = 1
 /** Chats running outside the flow, in their own folders: what the running-chat browser offers. */
 export type Running = { sessionId: string; name: string; cwd: string }
 
-export function world(on: any, graph: { agents: unknown[]; links: unknown[] }, self = 'sid-a', others: Running[] = []): World {
+export function world(on: any, graph: { agents: unknown[]; links: unknown[] }, self = 'sid-a', others: Running[] = [], env: Record<string, string> = {}): World {
   const sessions = [...(graph.agents as { sessionId?: string; name: string; cwd?: string }[]).filter(a => a.sessionId), ...others]
   const files: Record<string, string> = {
     [FLOW]: JSON.stringify({ version: 2, id: 'f1', name: 'Test flow', ...graph }),
@@ -43,7 +47,7 @@ export function world(on: any, graph: { agents: unknown[]; links: unknown[] }, s
   sessions.forEach((a, i) => {
     files[`${HOME}/.claude/sessions/${100 + i}.json`] = JSON.stringify({ sessionId: a.sessionId, pid: 100 + i, kind: 'interactive', name: a.name, cwd: a.cwd ?? ROOT, startedAt: 1 })
   })
-  const w: World = { files, dirs: new Set(), sent: [], toasts: [], self: { id: self }, answer: { fn: () => 'YES' } }
+  const w: World = { files, dirs: new Set(), sent: [], toasts: [], self: { id: self }, answer: { fn: () => 'YES' }, clipboard: { text: '' }, cmux: { tree: '', ran: [] } }
   const mtimes: Record<string, number> = Object.fromEntries(Object.keys(files).map(f => [f, clock++]))
   const mtimeOf = (p: string) => mtimes[p] ?? Math.max(0, ...Object.keys(mtimes).filter(f => f.startsWith(p + '/')).map(f => mtimes[f]!))
   const dirOf = (p: string) => p.slice(0, p.lastIndexOf('/'))
@@ -51,9 +55,10 @@ export function world(on: any, graph: { agents: unknown[]; links: unknown[] }, s
   const missing = (p: string) => Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' })
   const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   const fail = () => ({ value: { exitCode: 1, stdout: '', stderr: 'exists', isStdoutTruncated: false, isStderrTruncated: false } })
-  mock.env(on, { HOME })
+  mock.env(on, { HOME, ...env })
   mock.store(on)
   on('session.root', async () => ({ value: ROOT }))
+  on('clock.now', async () => ({ value: Date.now() }))
   on('session.id', async () => ({ value: w.self.id }))
   on('fs.read', async (_$: unknown, e: any) => {
     if (!(e.path in files)) throw missing(e.path)
@@ -76,7 +81,20 @@ export function world(on: any, graph: { agents: unknown[]; links: unknown[] }, s
   })
   on('process.run', async (_$: unknown, e: any) => {
     const [cmd, ...rest] = e.argv as string[]
+    // Chat i runs in terminal ttys10i.
+    if (cmd === 'ps' && rest.includes('tty=')) return ok(`ttys${rest[rest.length - 1]}\n`)
     if (cmd === 'ps') return ok(sessions.map((_, i) => String(100 + i)).join('\n'))
+    if (cmd === '/cmux') {
+      w.cmux.ran.push(rest)
+      if (rest[0] === 'tree') return ok(w.cmux.tree)
+    }
+    if (cmd === 'pbpaste') return ok(w.clipboard.text)
+    // A chat's transcript: found by name anywhere in the files, read from its tail.
+    if (cmd === 'find' && rest.includes('-name')) {
+      const name = rest[rest.indexOf('-name') + 1]!
+      return ok(Object.keys(files).filter(f => f.endsWith(`/${name}`)).join('\n'))
+    }
+    if (cmd === 'tail') return ok(files[rest[rest.length - 1]!] ?? '')
     if (cmd === 'mv') {
       files[rest[2]!] = files[rest[1]!]!
       mtimes[rest[2]!] = clock++

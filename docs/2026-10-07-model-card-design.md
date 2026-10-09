@@ -58,8 +58,13 @@ The model and effort resolved from the agent's model link are added as
 - opening the chat in a new tab (`openSession`).
 
 The link is read at launch, so re-linking applies from the next run. A chat
-already open in a tab keeps the model it started with; Run hands it the message
-in place. Its side panel says so: `Open in a tab: uses the model it opened with`.
+already open in a tab switches too: Agent Flows in that chat names the card's
+model and effort on each model request (`turn.step`), so it applies from the
+chat's next message. `/model` was ruled out: it also saves the choice as the
+person's default for new chats. A request takes no alias, so `opus`, `sonnet` and
+`haiku` become that family's first id in the Extra models option; with none
+there the request is left as it was. Its side panel says
+`Open in a tab: used from its next message`.
 
 ## The model list
 

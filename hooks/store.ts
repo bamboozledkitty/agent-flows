@@ -48,6 +48,7 @@ const isModel = (v: unknown) => v === undefined || isModelId(v)
 const isAgent = (a: any): a is FlowNode =>
   isId(a?.id) && isStr(a.name) && isNum(a.x) && isNum(a.y) && isStr(a.prompt) && MODES.includes(a.mode) &&
   (a.sessionId === undefined || a.sessionId === '' || isId(a.sessionId)) && (a.cwd === undefined || (isStr(a.cwd) && a.cwd.startsWith('/'))) &&
+  (a.instructions === undefined || isStr(a.instructions)) &&
   (a.kind === undefined || KINDS.includes(a.kind)) && isCard(a.card) && isModel(a.card?.model)
 
 const isLink = (l: any): l is FlowEdge =>
