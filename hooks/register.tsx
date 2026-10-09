@@ -948,19 +948,23 @@ async function openSession($: EngineInterface, id: string) {
 
   const cmux = await $.env.get('CMUX_BUNDLED_CLI_PATH')
   const term = await $.env.get('TERM_PROGRAM')
-  // One new tab in the terminal this chat runs in; each program is named at its call.
-  const r = cmux
-    ? await $.process.run([cmux, 'new-surface', '--type', 'terminal', '--command', command, '--focus', 'true'])
+  // A new tab in the terminal this chat runs in, where the plugin knows how to ask
+  // for one; each program is named at its call.
+  const here = cmux
+    ? await $.process.run([cmux, 'new-surface', '--type', 'terminal', '--command', command, '--focus', 'true']).catch(() => null)
     : term === 'ghostty'
-      ? await $.process.run(['open', '-na', 'Ghostty', '--args', `--working-directory=${root}`, '-e', 'claude', ...claudeArgs])
+      ? await $.process.run(['open', '-na', 'Ghostty', '--args', `--working-directory=${root}`, '-e', 'claude', ...claudeArgs]).catch(() => null)
       : term === 'iTerm.app'
-        ? await $.process.run(['osascript', `${$.plugin.root}/scripts/open-iterm.applescript`, command])
-        : term === 'Apple_Terminal'
-          ? await $.process.run(['osascript', `${$.plugin.root}/scripts/open-terminal.applescript`, command])
-          : null
+        ? await $.process.run(['osascript', `${$.plugin.root}/scripts/open-iterm.applescript`, command]).catch(() => null)
+        : null
+  // Any other terminal, the desktop app, or a tab that wouldn't open: a new window
+  // of the Mac's own Terminal, which every Mac has.
+  const r = here?.exitCode === 0
+    ? here
+    : await $.process.run(['osascript', `${$.plugin.root}/scripts/open-terminal.applescript`, command]).catch(() => null)
   if (!r || r.exitCode !== 0) {
     await $.ui.copy({ text: command })
-    $.ui.toast(`Couldn't open a new tab here. Copied the command; paste it in a new terminal.`)
+    $.ui.toast(`Couldn't open a terminal here. Copied the command; paste it in a new terminal.`)
     return
   }
   await log($, `⧉ opened ${node.name}`)

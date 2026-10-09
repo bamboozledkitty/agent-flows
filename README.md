@@ -213,11 +213,13 @@ has no telemetry.
 - `claude -p`, for an agent's background run, with the card's permission mode
   (default, accept edits or plan; never one that skips permissions) and, when a
   Model card links in, `--model` and `--effort`.
-- A new terminal tab running `claude`, when you open an agent's chat: through
-  `cmux` (the path in `CMUX_BUNDLED_CLI_PATH`), `open -na Ghostty`, or
-  `osascript` with one of the two short scripts in `scripts/`, which tell iTerm
-  or Terminal to run that one command. If none fits,
-  the command is copied for you to paste.
+- A terminal running `claude`, when you open an agent's chat. In cmux, Ghostty
+  or iTerm it is a new tab or window there (`cmux`, at the path in
+  `CMUX_BUNDLED_CLI_PATH`; `open -na Ghostty`; or `osascript` with
+  `scripts/open-iterm.applescript`). Anywhere else, the desktop app included, it
+  is a new window of the Mac's own Terminal (`osascript` with
+  `scripts/open-terminal.applescript`). Off a Mac, the command is copied for you
+  to paste.
 - In cmux only: `cmux tree` and `cmux surface open`, to switch to an agent's tab
   that is already open.
 - `pbpaste`, when you press Cmd+V in one of the canvas's text boxes: the
